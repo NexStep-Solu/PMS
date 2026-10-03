@@ -1,0 +1,1101 @@
+-- =====================================================================
+-- PMS — Project Management System
+-- 0001_init.sql : schema, indexes, triggers, RLS and storage
+--
+-- Run with:  supabase db push        (or paste into the SQL editor)
+--
+-- Design notes
+--   * Every tenant-owned row carries organization_id so policies can be
+--     evaluated with a single indexed lookup.
+--   * RLS is the security boundary. The client only ever receives the anon
+--     key; no policy trusts a user supplied organization id.
+-- =====================================================================
+
+create extension if not exists "pgcrypto";
+create extension if not exists "citext";
+
+-- ---------------------------------------------------------------------
+-- Enums
+-- ---------------------------------------------------------------------
+
+create type public.role as enum ('owner', 'admin', 'manager', 'member', 'viewer');
+create type public.project_role as enum ('owner', 'manager', 'member', 'viewer');
+create type public.project_status as enum ('planned', 'active', 'on_hold', 'completed', 'archived');
+create type public.project_priority as enum ('low', 'medium', 'high', 'urgent');
+create type public.status_category as enum ('backlog', 'todo', 'in_progress', 'review', 'done', 'cancelled');
+create type public.milestone_status as enum ('planned', 'in_progress', 'completed');
+create type public.invitation_status as enum ('pending', 'accepted', 'revoked', 'expired');
+
+-- ---------------------------------------------------------------------
+-- updated_at automation
+-- ---------------------------------------------------------------------
+
+create or replace function public.set_updated_at()
+returns trigger
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- Profiles (mirrors auth.users)
+-- ---------------------------------------------------------------------
+
+create table public.profiles (
+  id uuid primary key references auth.users (id) on delete cascade,
+  full_name text,
+  avatar_url text,
+  timezone text not null default 'UTC',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+comment on table public.profiles is 'Public profile for every authenticated user.';
+
+create trigger profiles_updated_at
+  before update on public.profiles
+  for each row execute function public.set_updated_at();
+
+-- Auto-create a profile (and a personal workspace) on signup.
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  new_org_id uuid;
+  base_slug text;
+  display_name text;
+begin
+  display_name := coalesce(new.raw_user_meta_data ->> 'full_name', split_part(new.email, '@', 1), 'New member');
+
+  insert into public.profiles (id, full_name, timezone)
+  values (
+    new.id,
+    display_name,
+    coalesce(new.raw_user_meta_data ->> 'timezone', 'UTC')
+  )
+  on conflict (id) do nothing;
+
+  base_slug := lower(regexp_replace(coalesce(new.raw_user_meta_data ->> 'organization_name', 'workspace'), '[^a-zA-Z0-9]+', '-', 'g'))
+             || '-' || substr(replace(new.id::text, '-', ''), 1, 6);
+
+  insert into public.organizations (name, slug, created_by)
+  values (coalesce(new.raw_user_meta_data ->> 'organization_name', 'My Workspace'), base_slug, new.id)
+  returning id into new_org_id;
+
+  insert into public.organization_members (organization_id, user_id, role)
+  values (new_org_id, new.id, 'owner');
+
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user();
+
+-- ---------------------------------------------------------------------
+-- Organisations & membership
+-- ---------------------------------------------------------------------
+
+create table public.organizations (
+  id uuid primary key default gen_random_uuid(),
+  name text not null check (char_length(trim(name)) between 1 and 80),
+  slug text not null unique check (slug ~ '^[a-z0-9]+(?:-[a-z0-9]+)*$'),
+  logo_url text,
+  created_by uuid not null references public.profiles (id) on delete restrict,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create trigger organizations_updated_at
+  before update on public.organizations
+  for each row execute function public.set_updated_at();
+
+create table public.organization_members (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations (id) on delete cascade,
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  role public.role not null default 'member',
+  joined_at timestamptz not null default now(),
+  unique (organization_id, user_id)
+);
+
+create index organization_members_user_idx on public.organization_members (user_id);
+create index organization_members_org_idx on public.organization_members (organization_id);
+
+create table public.organization_invitations (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations (id) on delete cascade,
+  email citext not null,
+  role public.role not null default 'member',
+  token uuid not null unique default gen_random_uuid(),
+  invited_by uuid not null references public.profiles (id) on delete cascade,
+  status public.invitation_status not null default 'pending',
+  expires_at timestamptz not null default now() + interval '14 days',
+  accepted_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+create index organization_invitations_org_idx on public.organization_invitations (organization_id);
+
+-- ---------------------------------------------------------------------
+-- Teams
+-- ---------------------------------------------------------------------
+
+create table public.teams (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations (id) on delete cascade,
+  name text not null check (char_length(trim(name)) between 1 and 80),
+  description text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (organization_id, name)
+);
+
+create trigger teams_updated_at before update on public.teams
+  for each row execute function public.set_updated_at();
+
+create table public.team_members (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references public.teams (id) on delete cascade,
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  created_at timestamptz not null default now(),
+  unique (team_id, user_id)
+);
+
+create index team_members_user_idx on public.team_members (user_id);
+
+-- ---------------------------------------------------------------------
+-- Projects
+-- ---------------------------------------------------------------------
+
+create table public.projects (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations (id) on delete cascade,
+  name text not null check (char_length(trim(name)) between 1 and 120),
+  key text not null check (key ~ '^[A-Z][A-Z0-9]{1,9}$'),
+  description text,
+  status public.project_status not null default 'planned',
+  priority public.project_priority not null default 'medium',
+  start_date date,
+  due_date date,
+  owner_id uuid references public.profiles (id) on delete set null,
+  created_by uuid not null references public.profiles (id) on delete restrict,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (organization_id, key),
+  constraint projects_dates_ordered check (due_date is null or start_date is null or due_date >= start_date)
+);
+
+create trigger projects_updated_at before update on public.projects
+  for each row execute function public.set_updated_at();
+
+create index projects_org_idx on public.projects (organization_id);
+create index projects_status_idx on public.projects (organization_id, status);
+
+create table public.project_members (
+  id uuid primary key default gen_random_uuid(),
+  project_id uuid not null references public.projects (id) on delete cascade,
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  role public.project_role not null default 'member',
+  created_at timestamptz not null default now(),
+  unique (project_id, user_id)
+);
+
+create index project_members_user_idx on public.project_members (user_id);
+
+-- ---------------------------------------------------------------------
+-- Task metadata: statuses, priorities, labels
+-- ---------------------------------------------------------------------
+
+create table public.task_statuses (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations (id) on delete cascade,
+  project_id uuid references public.projects (id) on delete cascade,
+  name text not null check (char_length(trim(name)) between 1 and 40),
+  key text not null,
+  category public.status_category not null,
+  color text,
+  position integer not null default 0,
+  is_default boolean not null default false,
+  is_completed boolean not null default false
+);
+
+create unique index task_statuses_org_key_unique
+  on public.task_statuses (organization_id, coalesce(project_id, '00000000-0000-0000-0000-000000000000'::uuid), key);
+create index task_statuses_org_idx on public.task_statuses (organization_id, position);
+
+create table public.priorities (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations (id) on delete cascade,
+  name text not null check (char_length(trim(name)) between 1 and 40),
+  key text not null,
+  level integer not null check (level between 1 and 10),
+  position integer not null default 0,
+  unique (organization_id, key)
+);
+
+create index priorities_org_idx on public.priorities (organization_id, position);
+
+create table public.labels (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations (id) on delete cascade,
+  name text not null check (char_length(trim(name)) between 1 and 40),
+  color text not null default '#64748b',
+  created_at timestamptz not null default now(),
+  unique (organization_id, name)
+);
+
+create index labels_org_idx on public.labels (organization_id);
+
+-- ---------------------------------------------------------------------
+-- Tasks
+-- ---------------------------------------------------------------------
+
+create table public.tasks (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations (id) on delete cascade,
+  project_id uuid not null references public.projects (id) on delete cascade,
+  parent_task_id uuid references public.tasks (id) on delete cascade,
+  title text not null check (char_length(trim(title)) between 1 and 200),
+  description text,
+  status_id uuid not null references public.task_statuses (id) on delete restrict,
+  priority_id uuid references public.priorities (id) on delete set null,
+  assignee_id uuid references public.profiles (id) on delete set null,
+  reporter_id uuid not null references public.profiles (id) on delete restrict,
+  start_date date,
+  due_date date,
+  estimated_minutes integer check (estimated_minutes is null or estimated_minutes >= 0),
+  position numeric not null default 1000,
+  completed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint tasks_dates_ordered check (due_date is null or start_date is null or due_date >= start_date),
+  constraint tasks_not_own_parent check (parent_task_id is null or parent_task_id <> id)
+);
+
+create trigger tasks_updated_at before update on public.tasks
+  for each row execute function public.set_updated_at();
+
+create index tasks_org_idx on public.tasks (organization_id);
+create index tasks_project_idx on public.tasks (project_id, position);
+create index tasks_assignee_idx on public.tasks (assignee_id) where assignee_id is not null;
+create index tasks_due_idx on public.tasks (due_date) where due_date is not null;
+create index tasks_parent_idx on public.tasks (parent_task_id) where parent_task_id is not null;
+create index tasks_status_idx on public.tasks (status_id);
+
+create table public.task_labels (
+  task_id uuid not null references public.tasks (id) on delete cascade,
+  label_id uuid not null references public.labels (id) on delete cascade,
+  primary key (task_id, label_id)
+);
+
+create index task_labels_label_idx on public.task_labels (label_id);
+
+create table public.task_comments (
+  id uuid primary key default gen_random_uuid(),
+  task_id uuid not null references public.tasks (id) on delete cascade,
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  content text not null check (char_length(trim(content)) between 1 and 5000),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create trigger task_comments_updated_at before update on public.task_comments
+  for each row execute function public.set_updated_at();
+
+create index task_comments_task_idx on public.task_comments (task_id, created_at);
+
+create table public.task_checklists (
+  id uuid primary key default gen_random_uuid(),
+  task_id uuid not null references public.tasks (id) on delete cascade,
+  title text not null check (char_length(trim(title)) between 1 and 200),
+  position integer not null default 0,
+  is_completed boolean not null default false
+);
+
+create index task_checklists_task_idx on public.task_checklists (task_id, position);
+
+create table public.task_attachments (
+  id uuid primary key default gen_random_uuid(),
+  task_id uuid not null references public.tasks (id) on delete cascade,
+  uploaded_by uuid not null references public.profiles (id) on delete cascade,
+  file_name text not null,
+  storage_path text not null,
+  file_size bigint not null default 0,
+  mime_type text not null default 'application/octet-stream',
+  created_at timestamptz not null default now()
+);
+
+create index task_attachments_task_idx on public.task_attachments (task_id);
+
+create table public.project_files (
+  id uuid primary key default gen_random_uuid(),
+  project_id uuid not null references public.projects (id) on delete cascade,
+  uploaded_by uuid not null references public.profiles (id) on delete cascade,
+  file_name text not null,
+  storage_path text not null,
+  file_size bigint not null default 0,
+  mime_type text not null default 'application/octet-stream',
+  created_at timestamptz not null default now()
+);
+
+create index project_files_project_idx on public.project_files (project_id);
+
+-- ---------------------------------------------------------------------
+-- Milestones
+-- ---------------------------------------------------------------------
+
+create table public.milestones (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations (id) on delete cascade,
+  project_id uuid not null references public.projects (id) on delete cascade,
+  name text not null check (char_length(trim(name)) between 1 and 120),
+  description text,
+  due_date date not null,
+  status public.milestone_status not null default 'planned',
+  position integer not null default 0,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create trigger milestones_updated_at before update on public.milestones
+  for each row execute function public.set_updated_at();
+
+create index milestones_project_idx on public.milestones (project_id, position);
+create index milestones_org_due_idx on public.milestones (organization_id, due_date);
+
+-- ---------------------------------------------------------------------
+-- Time tracking
+-- ---------------------------------------------------------------------
+
+create table public.time_entries (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations (id) on delete cascade,
+  project_id uuid not null references public.projects (id) on delete cascade,
+  task_id uuid references public.tasks (id) on delete set null,
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  started_at timestamptz not null default now(),
+  ended_at timestamptz,
+  duration_minutes integer check (duration_minutes is null or duration_minutes >= 0),
+  description text,
+  is_running boolean not null default true,
+  created_at timestamptz not null default now(),
+  constraint time_entries_has_end check (ended_at is null or ended_at >= started_at)
+);
+
+create unique index time_entries_single_running_per_user
+  on public.time_entries (user_id)
+  where is_running;
+
+create index time_entries_org_idx on public.time_entries (organization_id, started_at desc);
+create index time_entries_user_idx on public.time_entries (user_id, started_at desc);
+create index time_entries_project_idx on public.time_entries (project_id);
+
+-- ---------------------------------------------------------------------
+-- Notifications & activity
+-- ---------------------------------------------------------------------
+
+create table public.notifications (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  organization_id uuid not null references public.organizations (id) on delete cascade,
+  type text not null,
+  title text not null,
+  message text,
+  data jsonb not null default '{}'::jsonb,
+  read_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+create index notifications_user_idx on public.notifications (user_id, created_at desc);
+create index notifications_unread_idx on public.notifications (user_id) where read_at is null;
+
+create table public.activity_logs (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations (id) on delete cascade,
+  user_id uuid references public.profiles (id) on delete set null,
+  entity_type text not null,
+  entity_id uuid not null,
+  action text not null,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index activity_logs_org_idx on public.activity_logs (organization_id, created_at desc);
+create index activity_logs_entity_idx on public.activity_logs (entity_type, entity_id);
+
+-- =====================================================================
+-- Helpers
+-- =====================================================================
+
+create or replace function public.current_user_id()
+returns uuid
+language sql
+stable
+security invoker
+set search_path = ''
+as $$ select auth.uid() $$;
+
+-- The role the current user holds in `target_org`, or null.
+create or replace function public.org_role(target_org uuid)
+returns public.role
+language sql
+stable
+security invoker
+set search_path = ''
+as $$
+  select role
+  from public.organization_members
+  where organization_id = target_org
+    and user_id = auth.uid()
+$$;
+
+create or replace function public.is_org_member(target_org uuid)
+returns boolean
+language sql
+stable
+security invoker
+set search_path = ''
+as $$ select exists (select 1 from public.organization_members
+                     where organization_id = target_org and user_id = auth.uid()) $$;
+
+create or replace function public.has_org_role(target_org uuid, allowed public.role[])
+returns boolean
+language sql
+stable
+security invoker
+set search_path = ''
+as $$ select coalesce(public.org_role(target_org) = any(allowed), false) $$;
+
+create or replace function public.is_org_admin(target_org uuid)
+returns boolean
+language sql
+stable
+security invoker
+set search_path = ''
+as $$
+  select public.has_org_role(target_org, array['owner', 'admin']::public.role[])
+$$;
+
+/** Task visibility: org membership, narrowed to project membership for viewers. */
+create or replace function public.can_read_task(target_org uuid, target_project uuid, assignee uuid)
+returns boolean
+language sql
+stable
+security invoker
+set search_path = ''
+as $$
+  select case
+    when not public.is_org_member(target_org) then false
+    when public.org_role(target_org) = 'viewer' then
+      assignee = auth.uid()
+      or exists (
+        select 1 from public.project_members pm
+        where pm.project_id = target_project and pm.user_id = auth.uid()
+      )
+    else true
+  end
+$$;
+
+/** Writes: members and above, plus explicit project membership. */
+create or replace function public.can_write_project(target_org uuid, target_project uuid)
+returns boolean
+language sql
+stable
+security invoker
+set search_path = ''
+as $$
+  select case
+    when not public.is_org_member(target_org) then false
+    when public.org_role(target_org) = 'viewer' then
+      exists (
+        select 1 from public.project_members pm
+        where pm.project_id = target_project and pm.user_id = auth.uid()
+      )
+    else true
+  end
+$$;
+
+create or replace function public.can_write_task(target_org uuid, target_project uuid)
+returns boolean
+language sql
+stable
+security invoker
+set search_path = ''
+as $$
+  select case
+    when not public.is_org_member(target_org) then false
+    when public.org_role(target_org) = 'viewer' then false
+    else public.can_write_project(target_org, target_project)
+  end
+$$;
+
+-- ---------------------------------------------------------------------
+-- Activity + notification side effects
+-- ---------------------------------------------------------------------
+
+-- Kept intentionally simple and explicit: the API layer writes activity rows
+-- through `record_activity()` so the metadata is human readable.
+create or replace function public.record_activity(
+  target_org uuid,
+  target_entity_type text,
+  target_entity_id uuid,
+  target_action text,
+  target_metadata jsonb default '{}'::jsonb
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  new_id uuid;
+begin
+  if not public.is_org_member(target_org) then
+    raise exception 'not a member of this organization' using errcode = '42501';
+  end if;
+
+  insert into public.activity_logs (organization_id, user_id, entity_type, entity_id, action, metadata)
+  values (target_org, auth.uid(), target_entity_type, target_entity_id, target_action, target_metadata)
+  returning id into new_id;
+
+  return new_id;
+end;
+$$;
+
+create or replace function public.notify(
+  target_user uuid,
+  target_org uuid,
+  target_type text,
+  target_title text,
+  target_message text default null,
+  target_data jsonb default '{}'::jsonb
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  new_id uuid;
+begin
+  if target_user = auth.uid() then return null; end if;
+
+  insert into public.notifications (user_id, organization_id, type, title, message, data)
+  values (target_user, target_org, target_type, target_title, target_message, target_data)
+  returning id into new_id;
+
+  return new_id;
+end;
+$$;
+
+-- =====================================================================
+-- Row Level Security
+-- =====================================================================
+
+alter table public.profiles                enable row level security;
+alter table public.organizations           enable row level security;
+alter table public.organization_members    enable row level security;
+alter table public.organization_invitations enable row level security;
+alter table public.teams                   enable row level security;
+alter table public.team_members            enable row level security;
+alter table public.projects                enable row level security;
+alter table public.project_members         enable row level security;
+alter table public.task_statuses           enable row level security;
+alter table public.priorities              enable row level security;
+alter table public.labels                  enable row level security;
+alter table public.tasks                   enable row level security;
+alter table public.task_labels             enable row level security;
+alter table public.task_comments           enable row level security;
+alter table public.task_checklists         enable row level security;
+alter table public.task_attachments        enable row level security;
+alter table public.project_files           enable row level security;
+alter table public.milestones              enable row level security;
+alter table public.time_entries            enable row level security;
+alter table public.notifications           enable row level security;
+alter table public.activity_logs           enable row level security;
+
+-- profiles -------------------------------------------------------------
+
+create policy profiles_select_self on public.profiles
+  for select to authenticated
+  using (
+    id = auth.uid()
+    or exists (
+      select 1 from public.organization_members mine
+      join public.organization_members theirs on theirs.organization_id = mine.organization_id
+      where mine.user_id = auth.uid() and theirs.user_id = profiles.id
+    )
+  );
+
+create policy profiles_update_self on public.profiles
+  for update to authenticated
+  using (id = auth.uid())
+  with check (id = auth.uid());
+
+create policy profiles_insert_self on public.profiles
+  for insert to authenticated
+  with check (id = auth.uid());
+
+-- organizations --------------------------------------------------------
+
+create policy organizations_select on public.organizations
+  for select to authenticated
+  using (public.is_org_member(id));
+
+create policy organizations_update on public.organizations
+  for update to authenticated
+  using (public.is_org_admin(id))
+  with check (public.is_org_admin(id));
+
+create policy organizations_insert on public.organizations
+  for insert to authenticated
+  with check (created_by = auth.uid());
+
+create policy organizations_delete on public.organizations
+  for delete to authenticated
+  using (public.org_role(id) = 'owner');
+
+-- organization_members -------------------------------------------------
+
+create policy org_members_select on public.organization_members
+  for select to authenticated
+  using (public.is_org_member(organization_id));
+
+create policy org_members_insert on public.organization_members
+  for insert to authenticated
+  with check (public.is_org_admin(organization_id));
+
+create policy org_members_update on public.organization_members
+  for update to authenticated
+  using (public.is_org_admin(organization_id))
+  with check (public.is_org_admin(organization_id));
+
+create policy org_members_delete on public.organization_members
+  for delete to authenticated
+  using (
+    public.is_org_admin(organization_id)
+    and not (user_id = auth.uid() and public.org_role(organization_id) = 'owner')
+  );
+
+-- organization_invitations --------------------------------------------
+
+create policy invitations_select on public.organization_invitations
+  for select to authenticated
+  using (public.is_org_admin(organization_id));
+
+create policy invitations_insert on public.organization_invitations
+  for insert to authenticated
+  with check (public.is_org_admin(organization_id) and invited_by = auth.uid());
+
+create policy invitations_update on public.organization_invitations
+  for update to authenticated
+  using (public.is_org_admin(organization_id))
+  with check (public.is_org_admin(organization_id));
+
+create policy invitations_delete on public.organization_invitations
+  for delete to authenticated
+  using (public.is_org_admin(organization_id));
+
+-- teams ----------------------------------------------------------------
+
+create policy teams_select on public.teams
+  for select to authenticated
+  using (public.is_org_member(organization_id));
+
+create policy teams_insert on public.teams
+  for insert to authenticated
+  with check (public.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]));
+
+create policy teams_update on public.teams
+  for update to authenticated
+  using (public.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]))
+  with check (public.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]));
+
+create policy teams_delete on public.teams
+  for delete to authenticated
+  using (public.is_org_admin(organization_id));
+
+-- team_members ---------------------------------------------------------
+
+create policy team_members_select on public.team_members
+  for select to authenticated
+  using (exists (select 1 from public.teams t where t.id = team_id and public.is_org_member(t.organization_id)));
+
+create policy team_members_write on public.team_members
+  for all to authenticated
+  using (exists (
+    select 1 from public.teams t
+    where t.id = team_id
+      and public.has_org_role(t.organization_id, array['owner', 'admin', 'manager']::public.role[])
+  ))
+  with check (exists (
+    select 1 from public.teams t
+    where t.id = team_id
+      and public.has_org_role(t.organization_id, array['owner', 'admin', 'manager']::public.role[])
+  ));
+
+-- projects -------------------------------------------------------------
+
+create policy projects_select on public.projects
+  for select to authenticated
+  using (
+    public.is_org_member(organization_id)
+    and (
+      public.org_role(organization_id) <> 'viewer'
+      or owner_id = auth.uid()
+      or exists (select 1 from public.project_members pm
+                 where pm.project_id = projects.id and pm.user_id = auth.uid())
+    )
+  );
+
+create policy projects_insert on public.projects
+  for insert to authenticated
+  with check (public.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]));
+
+create policy projects_update on public.projects
+  for update to authenticated
+  using (public.can_write_project(organization_id, id))
+  with check (public.can_write_project(organization_id, id));
+
+create policy projects_delete on public.projects
+  for delete to authenticated
+  using (public.has_org_role(organization_id, array['owner', 'admin']::public.role[]));
+
+-- project_members ------------------------------------------------------
+
+create policy project_members_select on public.project_members
+  for select to authenticated
+  using (exists (select 1 from public.projects p
+                 where p.id = project_id and public.is_org_member(p.organization_id)));
+
+create policy project_members_write on public.project_members
+  for all to authenticated
+  using (public.can_write_project(
+    (select p.organization_id from public.projects p where p.id = project_id),
+    project_id
+  ))
+  with check (public.can_write_project(
+    (select p.organization_id from public.projects p where p.id = project_id),
+    project_id
+  ));
+
+-- task_statuses / priorities / labels ---------------------------------
+
+create policy statuses_select on public.task_statuses
+  for select to authenticated using (public.is_org_member(organization_id));
+create policy statuses_write on public.task_statuses
+  for all to authenticated
+  using (public.has_org_role(organization_id, array['owner', 'admin']::public.role[]))
+  with check (public.has_org_role(organization_id, array['owner', 'admin']::public.role[]));
+
+create policy priorities_select on public.priorities
+  for select to authenticated using (public.is_org_member(organization_id));
+create policy priorities_write on public.priorities
+  for all to authenticated
+  using (public.has_org_role(organization_id, array['owner', 'admin']::public.role[]))
+  with check (public.has_org_role(organization_id, array['owner', 'admin']::public.role[]));
+
+create policy labels_select on public.labels
+  for select to authenticated using (public.is_org_member(organization_id));
+create policy labels_write on public.labels
+  for all to authenticated
+  using (public.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]))
+  with check (public.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]));
+
+-- tasks ----------------------------------------------------------------
+
+create policy tasks_select on public.tasks
+  for select to authenticated
+  using (public.can_read_task(organization_id, project_id, assignee_id));
+
+create policy tasks_insert on public.tasks
+  for insert to authenticated
+  with check (
+    public.can_write_task(organization_id, project_id)
+    and reporter_id = auth.uid()
+    and public.is_org_member(organization_id)
+  );
+
+create policy tasks_update on public.tasks
+  for update to authenticated
+  using (public.can_write_task(organization_id, project_id))
+  with check (public.can_write_task(organization_id, project_id));
+
+create policy tasks_delete on public.tasks
+  for delete to authenticated
+  using (
+    reporter_id = auth.uid()
+    or public.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[])
+  );
+
+-- task_labels ----------------------------------------------------------
+
+create policy task_labels_select on public.task_labels
+  for select to authenticated
+  using (exists (select 1 from public.tasks t where t.id = task_id and public.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
+
+create policy task_labels_write on public.task_labels
+  for all to authenticated
+  using (exists (select 1 from public.tasks t where t.id = task_id and public.can_write_task(t.organization_id, t.project_id)))
+  with check (exists (select 1 from public.tasks t where t.id = task_id and public.can_write_task(t.organization_id, t.project_id)));
+
+-- task_comments --------------------------------------------------------
+
+create policy task_comments_select on public.task_comments
+  for select to authenticated
+  using (exists (select 1 from public.tasks t where t.id = task_id and public.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
+
+create policy task_comments_insert on public.task_comments
+  for insert to authenticated
+  with check (
+    user_id = auth.uid()
+    and exists (select 1 from public.tasks t where t.id = task_id and public.can_read_task(t.organization_id, t.project_id, t.assignee_id))
+  );
+
+create policy task_comments_update on public.task_comments
+  for update to authenticated
+  using (user_id = auth.uid())
+  with check (user_id = auth.uid());
+
+create policy task_comments_delete on public.task_comments
+  for delete to authenticated
+  using (user_id = auth.uid() or public.is_org_admin((select t.organization_id from public.tasks t where t.id = task_id)));
+
+-- task_checklists ------------------------------------------------------
+
+create policy task_checklists_select on public.task_checklists
+  for select to authenticated
+  using (exists (select 1 from public.tasks t where t.id = task_id and public.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
+
+create policy task_checklists_write on public.task_checklists
+  for all to authenticated
+  using (exists (select 1 from public.tasks t where t.id = task_id and public.can_write_task(t.organization_id, t.project_id)))
+  with check (exists (select 1 from public.tasks t where t.id = task_id and public.can_write_task(t.organization_id, t.project_id)));
+
+-- attachments ----------------------------------------------------------
+
+create policy task_attachments_select on public.task_attachments
+  for select to authenticated
+  using (exists (select 1 from public.tasks t where t.id = task_id and public.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
+
+create policy task_attachments_insert on public.task_attachments
+  for insert to authenticated
+  with check (
+    uploaded_by = auth.uid()
+    and exists (select 1 from public.tasks t where t.id = task_id and public.can_write_task(t.organization_id, t.project_id))
+  );
+
+create policy task_attachments_delete on public.task_attachments
+  for delete to authenticated
+  using (
+    uploaded_by = auth.uid()
+    or exists (select 1 from public.tasks t where t.id = task_id and public.can_write_task(t.organization_id, t.project_id))
+  );
+
+create policy project_files_select on public.project_files
+  for select to authenticated
+  using (exists (select 1 from public.projects p where p.id = project_id and public.is_org_member(p.organization_id)));
+
+create policy project_files_insert on public.project_files
+  for insert to authenticated
+  with check (
+    uploaded_by = auth.uid()
+    and exists (select 1 from public.projects p where p.id = project_id and public.can_write_project(p.organization_id, p.id))
+  );
+
+create policy project_files_delete on public.project_files
+  for delete to authenticated
+  using (
+    uploaded_by = auth.uid()
+    or exists (select 1 from public.projects p where p.id = project_id and public.can_write_project(p.organization_id, p.id))
+  );
+
+-- milestones -----------------------------------------------------------
+
+create policy milestones_select on public.milestones
+  for select to authenticated
+  using (public.can_read_task(organization_id, project_id, auth.uid()));
+
+create policy milestones_write on public.milestones
+  for all to authenticated
+  using (public.can_write_task(organization_id, project_id))
+  with check (public.can_write_task(organization_id, project_id));
+
+-- time_entries ---------------------------------------------------------
+
+create policy time_entries_select on public.time_entries
+  for select to authenticated
+  using (
+    public.is_org_member(organization_id)
+    and (user_id = auth.uid() or public.org_role(organization_id) <> 'viewer')
+  );
+
+create policy time_entries_insert on public.time_entries
+  for insert to authenticated
+  with check (user_id = auth.uid() and public.can_write_project(organization_id, project_id));
+
+create policy time_entries_update on public.time_entries
+  for update to authenticated
+  using (user_id = auth.uid() or public.is_org_admin(organization_id))
+  with check (user_id = auth.uid() or public.is_org_admin(organization_id));
+
+create policy time_entries_delete on public.time_entries
+  for delete to authenticated
+  using (user_id = auth.uid() or public.is_org_admin(organization_id));
+
+-- notifications --------------------------------------------------------
+
+create policy notifications_select on public.notifications
+  for select to authenticated using (user_id = auth.uid());
+
+create policy notifications_update on public.notifications
+  for update to authenticated
+  using (user_id = auth.uid())
+  with check (user_id = auth.uid());
+
+create policy notifications_delete on public.notifications
+  for delete to authenticated using (user_id = auth.uid());
+
+-- activity_logs --------------------------------------------------------
+
+create policy activity_logs_select on public.activity_logs
+  for select to authenticated
+  using (public.is_org_member(organization_id));
+
+create policy activity_logs_insert on public.activity_logs
+  for insert to authenticated
+  with check (public.is_org_member(organization_id));
+
+-- =====================================================================
+-- Realtime
+-- =====================================================================
+
+alter publication supabase_realtime add table public.tasks;
+alter publication supabase_realtime add table public.task_comments;
+alter publication supabase_realtime add table public.notifications;
+alter publication supabase_realtime add table public.activity_logs;
+
+-- =====================================================================
+-- Storage
+-- =====================================================================
+
+insert into storage.buckets (id, name, public)
+values ('avatars', 'avatars', true),
+       ('project-files', 'project-files', false),
+       ('task-attachments', 'task-attachments', false)
+on conflict (id) do nothing;
+
+-- Objects live at  organizations/{orgId}/projects/{projectId}/...
+create or replace function public.storage_org_id(object_name text)
+returns uuid
+language plpgsql
+immutable
+as $$
+declare
+  segment text;
+begin
+  segment := split_part(object_name, '/', 2);
+  if segment ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+    return segment::uuid;
+  end if;
+  return null;
+end;
+$$;
+
+create policy storage_avatars_read on storage.objects
+  for select to authenticated
+  using (bucket_id = 'avatars');
+
+create policy storage_avatars_write on storage.objects
+  for insert to authenticated
+  with check (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
+
+create policy storage_project_files_read on storage.objects
+  for select to authenticated
+  using (bucket_id = 'project-files' and public.is_org_member(public.storage_org_id(name)));
+
+create policy storage_project_files_write on storage.objects
+  for insert to authenticated
+  with check (bucket_id = 'project-files' and public.is_org_member(public.storage_org_id(name)));
+
+create policy storage_project_files_delete on storage.objects
+  for delete to authenticated
+  using (bucket_id = 'project-files' and public.is_org_member(public.storage_org_id(name)));
+
+create policy storage_attachments_read on storage.objects
+  for select to authenticated
+  using (bucket_id = 'task-attachments' and public.is_org_member(public.storage_org_id(name)));
+
+create policy storage_attachments_write on storage.objects
+  for insert to authenticated
+  with check (bucket_id = 'task-attachments' and public.is_org_member(public.storage_org_id(name)));
+
+create policy storage_attachments_delete on storage.objects
+  for delete to authenticated
+  using (bucket_id = 'task-attachments' and public.is_org_member(public.storage_org_id(name)));
+
+-- =====================================================================
+-- Workspace defaults
+-- =====================================================================
+
+create or replace function public.seed_workspace_defaults(target_org uuid)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  insert into public.task_statuses (organization_id, name, key, category, position, is_default, is_completed) values
+    (target_org, 'Backlog',    'backlog',    'backlog',    1, false, false),
+    (target_org, 'Todo',       'todo',       'todo',       2, true,  false),
+    (target_org, 'In Progress','in_progress','in_progress',3, false, false),
+    (target_org, 'Review',     'review',     'review',     4, false, false),
+    (target_org, 'Done',       'done',       'done',       5, false, true),
+    (target_org, 'Cancelled',  'cancelled',  'cancelled',  6, false, true)
+  on conflict do nothing;
+
+  insert into public.priorities (organization_id, name, key, level, position) values
+    (target_org, 'Urgent', 'urgent', 1, 1),
+    (target_org, 'High',   'high',   2, 2),
+    (target_org, 'Medium', 'medium', 3, 3),
+    (target_org, 'Low',    'low',    4, 4)
+  on conflict do nothing;
+end;
+$$;
+
+create or replace function public.handle_new_organization()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform public.seed_workspace_defaults(new.id);
+  return new;
+end;
+$$;
+
+create trigger on_organization_created
+  after insert on public.organizations
+  for each row execute function public.handle_new_organization();
+
+-- Backfill defaults for workspaces created before this migration.
+do $$
+declare
+  org record;
+begin
+  for org in select id from public.organizations loop
+    perform public.seed_workspace_defaults(org.id);
+  end loop;
+end;
+$$;
