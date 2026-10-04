@@ -36,16 +36,28 @@ changes.
 Email confirmation is on by default; if you turn it off, `signUp` returns a
 session immediately and the app routes straight to the dashboard.
 
-## Applying it to a project you already touched
+## Re-running it
 
-The migration is written to be re-runnable for policies
-(`drop policy if exists` precedes every `create policy`), but `create table` is
-not idempotent. If a first attempt failed part-way — for example with
-`infinite recursion detected in policy for relation "organization_members"` —
-the cleanest fix while still in development is:
+The migration is **safe to run repeatedly** — every statement is guarded:
 
-**Dashboard → Database → Reset** (or `supabase db reset`), then paste the file
-once more into a clean database.
+| Statement | Guard |
+| --- | --- |
+| `create type ... as enum` | `if not exists (select 1 from pg_type …)` |
+| `create table` | `if to_regclass('…') is null then` |
+| `create index` | `create index if not exists` |
+| `create trigger` | `if not exists (select 1 from pg_trigger where tgname = …)` |
+| `create policy` | `drop policy if exists` immediately before |
+| `create or replace function` | replaces by definition |
+| `alter publication … add table` | `if not exists (select 1 from pg_publication_tables …)` |
+| `insert into storage.buckets` | `on conflict (id) do nothing` |
+
+So to apply a change: **SQL Editor → paste `migrations/0001_init.sql` → Run.**
+No reset needed.
+
+If you hit an error that left the schema half-applied, run it a second time —
+the guards make the retry safe. Resetting
+(**Dashboard → Database → Reset**) also works and is still the cleanest option
+if you want certainty, because it drops the data too.
 
 That recursion error is the reason the RLS helper functions live in a
 non-exposed `private` schema as `SECURITY DEFINER`: a policy on
@@ -53,6 +65,15 @@ non-exposed `private` schema as `SECURITY DEFINER`: a policy on
 `SECURITY INVOKER` its own query would re-enter the policy on
 `organization_members` until Postgres gave up with a stack-depth failure. See
 the long comment above the helpers in the migration.
+
+## Verifying it applied
+
+Run **`verify.sql`** (SQL Editor → paste → Run). Eight read-only checks:
+table count and RLS coverage, helpers living in `private`, `anon` denied
+access to them, policy coverage per table, no policy left pointing at the old
+`public` helper names, storage buckets, signup trigger, and realtime
+publication. Check 5 in particular is worth a glance — it catches a half-applied
+edit that would otherwise only fail as "function does not exist" at query time.
 
 ## Environment
 
