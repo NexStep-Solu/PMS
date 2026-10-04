@@ -24,7 +24,7 @@ const TASK_SELECT = `
   status:task_statuses!tasks_status_id_fkey(*),
   priority:priorities!tasks_priority_id_fkey(*),
   assignee:profiles!tasks_assignee_id_fkey(id, full_name, avatar_url),
-  labels:task_labels(task_labels!inner(label:labels!task_labels_label_id_fkey(*)))
+  labels:task_labels(label:labels(*))
 `
 
 /* ------------------------------------------------------------------ */

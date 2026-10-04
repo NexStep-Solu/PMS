@@ -93,6 +93,32 @@ where schemaname = 'public'
 -- Expect: 0 rows.
 
 -- ---------------------------------------------------------------------
+-- 5b. No policy may read another RLS-protected table directly.
+--     Postgres aborts with `infinite recursion detected in policy for
+--     relation "projects"` when two policies read each other, which is what
+--     happened before every lookup was routed through a `private.*` definer.
+--     Expect 0 rows.
+-- ---------------------------------------------------------------------
+with policy_reads as (
+  select policyname, tablename, qual as expression from pg_policies where schemaname = 'public'
+),
+edges as (
+  select
+    policyname,
+    tablename as reader,
+    (regexp_matches(qual, 'from public\.(\w+)', 'g'))[1]::regclass::text as reads
+  from policy_reads
+)
+select policyname, reader, reads
+from edges
+where reads <> reader
+  and reads in (select relname from pg_class c
+                join pg_namespace n on n.oid = c.relnamespace
+                where n.nspname = 'public' and c.relkind = 'r')
+order by reader, reads;
+-- Expect: 0 rows.
+
+-- ---------------------------------------------------------------------
 -- 6. Storage buckets exist.
 -- ---------------------------------------------------------------------
 select id, public, file_size_limit from storage.buckets order by id;

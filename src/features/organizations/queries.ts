@@ -61,7 +61,7 @@ export function useTeams() {
     queryFn: async () => {
       const { data, error } = await db()
         .from('teams')
-        .select('*, team_members(team_members!inner(user_id))')
+        .select('id, name, description, team_members(user_id)')
         .eq('organization_id', organizationId as string)
         .order('name')
       if (error) throw error

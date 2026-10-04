@@ -691,6 +691,125 @@ as $$
 $$;
 
 /** Task visibility: org membership, narrowed to project membership for viewers. */
+-- Lookups used by policies on child tables. SECURITY DEFINER for the same
+-- reason as the helpers above: `project_members_select` must be able to ask
+-- "which organisation owns this project?" without that read re-entering
+-- `projects_select`, whose policy in turn reads `project_members`. Routing
+-- every cross-table lookup through a definer function is what keeps the policy
+-- graph a DAG instead of a cycle.
+create or replace function private.project_org(target_project uuid)
+returns uuid
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select p.organization_id from public.projects p where p.id = target_project
+$$;
+
+create or replace function private.team_org(target_team uuid)
+returns uuid
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select t.organization_id from public.teams t where t.id = target_team
+$$;
+
+create or replace function private.is_project_member(target_project uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1 from public.project_members
+    where project_id = target_project and user_id = auth.uid()
+  )
+$$;
+
+create or replace function private.can_read_project(target_org uuid, target_project uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select case
+    when not private.is_org_member(target_org) then false
+    when private.org_role(target_org) <> 'viewer' then true
+    else private.is_project_member(target_project)
+  end
+$$;
+
+create or replace function private.task_org(target_task uuid)
+returns uuid
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select t.organization_id from public.tasks t where t.id = target_task
+$$;
+
+create or replace function private.can_read_task_for(target_task uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1 from public.tasks t
+    where t.id = target_task
+      and private.can_read_task(t.organization_id, t.project_id, t.assignee_id)
+  )
+$$;
+
+create or replace function private.can_write_task_for(target_task uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1 from public.tasks t
+    where t.id = target_task
+      and private.can_write_task(t.organization_id, t.project_id)
+  )
+$$;
+
+create or replace function private.shares_workspace(target_user uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+    from public.organization_members mine
+    join public.organization_members theirs on theirs.organization_id = mine.organization_id
+    where mine.user_id = auth.uid() and theirs.user_id = target_user
+  )
+$$;
+
+create or replace function private.is_org_member_in(target_org uuid, target_user uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1 from public.organization_members
+    where organization_id = target_org and user_id = target_user
+  )
+$$;
+
 create or replace function private.can_read_task(target_org uuid, target_project uuid, assignee uuid)
 returns boolean
 language sql
@@ -837,11 +956,7 @@ create policy notifications_insert on public.notifications
   for insert to authenticated
   with check (
     private.is_org_member(organization_id)
-    and exists (
-      select 1 from public.organization_members m
-      where m.organization_id = notifications.organization_id
-        and m.user_id = notifications.user_id
-    )
+    and private.is_org_member_in(organization_id, user_id)
   );
 
 -- =====================================================================
@@ -880,11 +995,7 @@ create policy profiles_select_self on public.profiles
   for select to authenticated
   using (
     id = auth.uid()
-    or exists (
-      select 1 from public.organization_members mine
-      join public.organization_members theirs on theirs.organization_id = mine.organization_id
-      where mine.user_id = auth.uid() and theirs.user_id = profiles.id
-    )
+    or private.shares_workspace(id)
   );
 
 drop policy if exists "profiles_update_self" on public.profiles;
@@ -998,21 +1109,13 @@ create policy teams_delete on public.teams
 drop policy if exists "team_members_select" on public.team_members;
 create policy team_members_select on public.team_members
   for select to authenticated
-  using (exists (select 1 from public.teams t where t.id = team_id and private.is_org_member(t.organization_id)));
+  using (private.is_org_member(private.team_org(team_id)));
 
 drop policy if exists "team_members_write" on public.team_members;
 create policy team_members_write on public.team_members
   for all to authenticated
-  using (exists (
-    select 1 from public.teams t
-    where t.id = team_id
-      and private.has_org_role(t.organization_id, array['owner', 'admin', 'manager']::public.role[])
-  ))
-  with check (exists (
-    select 1 from public.teams t
-    where t.id = team_id
-      and private.has_org_role(t.organization_id, array['owner', 'admin', 'manager']::public.role[])
-  ));
+  using (private.has_org_role(private.team_org(team_id), array['owner', 'admin', 'manager']::public.role[]))
+  with check (private.has_org_role(private.team_org(team_id), array['owner', 'admin', 'manager']::public.role[]));
 
 -- projects -------------------------------------------------------------
 
@@ -1024,8 +1127,7 @@ create policy projects_select on public.projects
     and (
       private.org_role(organization_id) <> 'viewer'
       or owner_id = auth.uid()
-      or exists (select 1 from public.project_members pm
-                 where pm.project_id = projects.id and pm.user_id = auth.uid())
+      or private.is_project_member(id)
     )
   );
 
@@ -1050,20 +1152,13 @@ create policy projects_delete on public.projects
 drop policy if exists "project_members_select" on public.project_members;
 create policy project_members_select on public.project_members
   for select to authenticated
-  using (exists (select 1 from public.projects p
-                 where p.id = project_id and private.is_org_member(p.organization_id)));
+  using (private.is_org_member(private.project_org(project_id)));
 
 drop policy if exists "project_members_write" on public.project_members;
 create policy project_members_write on public.project_members
   for all to authenticated
-  using (private.can_write_project(
-    (select p.organization_id from public.projects p where p.id = project_id),
-    project_id
-  ))
-  with check (private.can_write_project(
-    (select p.organization_id from public.projects p where p.id = project_id),
-    project_id
-  ));
+  using (private.can_write_project(private.project_org(project_id), project_id))
+  with check (private.can_write_project(private.project_org(project_id), project_id));
 
 -- task_statuses / priorities / labels ---------------------------------
 
@@ -1129,27 +1224,27 @@ create policy tasks_delete on public.tasks
 drop policy if exists "task_labels_select" on public.task_labels;
 create policy task_labels_select on public.task_labels
   for select to authenticated
-  using (exists (select 1 from public.tasks t where t.id = task_id and private.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
+  using (private.can_read_task_for(task_id));
 
 drop policy if exists "task_labels_write" on public.task_labels;
 create policy task_labels_write on public.task_labels
   for all to authenticated
-  using (exists (select 1 from public.tasks t where t.id = task_id and private.can_write_task(t.organization_id, t.project_id)))
-  with check (exists (select 1 from public.tasks t where t.id = task_id and private.can_write_task(t.organization_id, t.project_id)));
+  using (private.can_write_task_for(task_id))
+  with check (private.can_write_task_for(task_id));
 
 -- task_comments --------------------------------------------------------
 
 drop policy if exists "task_comments_select" on public.task_comments;
 create policy task_comments_select on public.task_comments
   for select to authenticated
-  using (exists (select 1 from public.tasks t where t.id = task_id and private.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
+  using (private.can_read_task_for(task_id));
 
 drop policy if exists "task_comments_insert" on public.task_comments;
 create policy task_comments_insert on public.task_comments
   for insert to authenticated
   with check (
     user_id = auth.uid()
-    and exists (select 1 from public.tasks t where t.id = task_id and private.can_read_task(t.organization_id, t.project_id, t.assignee_id))
+    and private.can_read_task_for(task_id)
   );
 
 drop policy if exists "task_comments_update" on public.task_comments;
@@ -1161,55 +1256,49 @@ create policy task_comments_update on public.task_comments
 drop policy if exists "task_comments_delete" on public.task_comments;
 create policy task_comments_delete on public.task_comments
   for delete to authenticated
-  using (user_id = auth.uid() or private.is_org_admin((select t.organization_id from public.tasks t where t.id = task_id)));
+  using (user_id = auth.uid() or private.is_org_admin(private.task_org(task_id)));
 
 -- task_checklists ------------------------------------------------------
 
 drop policy if exists "task_checklists_select" on public.task_checklists;
 create policy task_checklists_select on public.task_checklists
   for select to authenticated
-  using (exists (select 1 from public.tasks t where t.id = task_id and private.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
+  using (private.can_read_task_for(task_id));
 
 drop policy if exists "task_checklists_write" on public.task_checklists;
 create policy task_checklists_write on public.task_checklists
   for all to authenticated
-  using (exists (select 1 from public.tasks t where t.id = task_id and private.can_write_task(t.organization_id, t.project_id)))
-  with check (exists (select 1 from public.tasks t where t.id = task_id and private.can_write_task(t.organization_id, t.project_id)));
+  using (private.can_write_task_for(task_id))
+  with check (private.can_write_task_for(task_id));
 
 -- attachments ----------------------------------------------------------
 
 drop policy if exists "task_attachments_select" on public.task_attachments;
 create policy task_attachments_select on public.task_attachments
   for select to authenticated
-  using (exists (select 1 from public.tasks t where t.id = task_id and private.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
+  using (private.can_read_task_for(task_id));
 
 drop policy if exists "task_attachments_insert" on public.task_attachments;
 create policy task_attachments_insert on public.task_attachments
   for insert to authenticated
-  with check (
-    uploaded_by = auth.uid()
-    and exists (select 1 from public.tasks t where t.id = task_id and private.can_write_task(t.organization_id, t.project_id))
-  );
+  with check (uploaded_by = auth.uid() and private.can_write_task_for(task_id));
 
 drop policy if exists "task_attachments_delete" on public.task_attachments;
 create policy task_attachments_delete on public.task_attachments
   for delete to authenticated
-  using (
-    uploaded_by = auth.uid()
-    or exists (select 1 from public.tasks t where t.id = task_id and private.can_write_task(t.organization_id, t.project_id))
-  );
+  using (uploaded_by = auth.uid() or private.can_write_task_for(task_id));
 
 drop policy if exists "project_files_select" on public.project_files;
 create policy project_files_select on public.project_files
   for select to authenticated
-  using (exists (select 1 from public.projects p where p.id = project_id and private.is_org_member(p.organization_id)));
+  using (private.is_org_member(private.project_org(project_id)));
 
 drop policy if exists "project_files_insert" on public.project_files;
 create policy project_files_insert on public.project_files
   for insert to authenticated
   with check (
     uploaded_by = auth.uid()
-    and exists (select 1 from public.projects p where p.id = project_id and private.can_write_project(p.organization_id, p.id))
+    and private.can_write_project(private.project_org(project_id), project_id)
   );
 
 drop policy if exists "project_files_delete" on public.project_files;
@@ -1217,7 +1306,7 @@ create policy project_files_delete on public.project_files
   for delete to authenticated
   using (
     uploaded_by = auth.uid()
-    or exists (select 1 from public.projects p where p.id = project_id and private.can_write_project(p.organization_id, p.id))
+    or private.can_write_project(private.project_org(project_id), project_id)
   );
 
 -- milestones -----------------------------------------------------------
@@ -1225,7 +1314,7 @@ create policy project_files_delete on public.project_files
 drop policy if exists "milestones_select" on public.milestones;
 create policy milestones_select on public.milestones
   for select to authenticated
-  using (private.can_read_task(organization_id, project_id, auth.uid()));
+  using (private.can_read_project(organization_id, project_id));
 
 drop policy if exists "milestones_write" on public.milestones;
 create policy milestones_write on public.milestones
@@ -1472,6 +1561,15 @@ grant execute on function private.storage_org_id(text) to authenticated;
 
 -- Helpers used inside RLS policies.
 revoke execute on function
+  private.project_org(uuid),
+  private.team_org(uuid),
+  private.task_org(uuid),
+  private.is_project_member(uuid),
+  private.can_read_project(uuid, uuid),
+  private.can_read_task_for(uuid),
+  private.can_write_task_for(uuid),
+  private.shares_workspace(uuid),
+  private.is_org_member_in(uuid, uuid),
   private.current_user_id(),
   private.org_role(uuid),
   private.is_org_member(uuid),
@@ -1479,10 +1577,20 @@ revoke execute on function
   private.is_org_admin(uuid),
   private.can_read_task(uuid, uuid, uuid),
   private.can_write_project(uuid, uuid),
-  private.can_write_task(uuid, uuid)
+  private.can_write_task(uuid, uuid),
+  private.storage_org_id(text)
   from public, anon;
 
 grant execute on function
+  private.project_org(uuid),
+  private.team_org(uuid),
+  private.task_org(uuid),
+  private.is_project_member(uuid),
+  private.can_read_project(uuid, uuid),
+  private.can_read_task_for(uuid),
+  private.can_write_task_for(uuid),
+  private.shares_workspace(uuid),
+  private.is_org_member_in(uuid, uuid),
   private.current_user_id(),
   private.org_role(uuid),
   private.is_org_member(uuid),
@@ -1490,5 +1598,6 @@ grant execute on function
   private.is_org_admin(uuid),
   private.can_read_task(uuid, uuid, uuid),
   private.can_write_project(uuid, uuid),
-  private.can_write_task(uuid, uuid)
+  private.can_write_task(uuid, uuid),
+  private.storage_org_id(text)
   to authenticated;

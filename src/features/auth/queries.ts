@@ -124,7 +124,7 @@ export function useWorkspaces(userId?: string | undefined) {
     queryFn: async (): Promise<Workspace[]> => {
       const { data, error } = await db()
         .from('organization_members')
-        .select('role, organizations!inner(id, name, slug, logo_url, created_by, created_at, updated_at)')
+        .select('role, organizations(id, name, slug, logo_url, created_by, created_at, updated_at)')
         .eq('user_id', resolvedUserId as string)
       if (error) throw error
 

@@ -59,12 +59,35 @@ the guards make the retry safe. Resetting
 (**Dashboard → Database → Reset**) also works and is still the cleanest option
 if you want certainty, because it drops the data too.
 
-That recursion error is the reason the RLS helper functions live in a
-non-exposed `private` schema as `SECURITY DEFINER`: a policy on
-`organization_members` has to call `is_org_member()`, and if that function were
-`SECURITY INVOKER` its own query would re-enter the policy on
-`organization_members` until Postgres gave up with a stack-depth failure. See
-the long comment above the helpers in the migration.
+### Why RLS policies abort with `infinite recursion detected`
+
+Postgres evaluates the policy on a table *before* returning any row from it. So
+if a policy on `projects` reads `project_members`, and the policy on
+`project_members` reads `projects`, neither can ever finish — Postgres gives up
+with `infinite recursion detected in policy for relation "projects"` (or a
+`max_stack_depth` failure).
+
+The rule this schema follows, which breaks every such cycle by construction:
+
+> **A policy may only read other tables through a `private.*` SECURITY DEFINER
+> helper — never with a direct `exists (select … from public.something)`.**
+
+The helpers live in a `private` schema that is not exposed to the Data API, so
+`anon` cannot call them at all. The second part matters too: if `is_org_member`
+were `SECURITY INVOKER`, its own read of `organization_members` would re-enter
+that table's policy and recurse.
+
+Two cycles showed up during development and are fixed:
+
+| Cycle | Was | Now |
+| --- | --- | --- |
+| `organization_members` | policy called `is_org_member()`, which read the same table | `private.is_org_member` (definer) |
+| `projects` ↔ `project_members` | each checked membership in the other with `exists` | `private.is_project_member(id)` / `private.project_org(project_id)` |
+
+`verify.sql` check **5b** asserts no policy reads a protected table directly,
+and `src/test/rls-policy-graph.test.ts` asserts the same from the repository
+side — including that the policy graph is acyclic — so this cannot regress
+without a test failing.
 
 ## Verifying it applied
 

@@ -22,7 +22,7 @@ import type { CreateProjectValues, UpdateProjectValues } from './schemas'
 const PROJECT_SELECT = `
   *,
   owner:profiles!projects_owner_id_fkey(id, full_name, avatar_url),
-  members:project_members(project_members!inner(id, role, user_id, profiles!project_members_user_id_fkey(id, full_name, avatar_url)))
+  members:project_members(id, role, user_id, profiles(id, full_name, avatar_url))
 `
 
 /* ------------------------------------------------------------------ */
