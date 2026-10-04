@@ -36,6 +36,24 @@ changes.
 Email confirmation is on by default; if you turn it off, `signUp` returns a
 session immediately and the app routes straight to the dashboard.
 
+## Applying it to a project you already touched
+
+The migration is written to be re-runnable for policies
+(`drop policy if exists` precedes every `create policy`), but `create table` is
+not idempotent. If a first attempt failed part-way — for example with
+`infinite recursion detected in policy for relation "organization_members"` —
+the cleanest fix while still in development is:
+
+**Dashboard → Database → Reset** (or `supabase db reset`), then paste the file
+once more into a clean database.
+
+That recursion error is the reason the RLS helper functions live in a
+non-exposed `private` schema as `SECURITY DEFINER`: a policy on
+`organization_members` has to call `is_org_member()`, and if that function were
+`SECURITY INVOKER` its own query would re-enter the policy on
+`organization_members` until Postgres gave up with a stack-depth failure. See
+the long comment above the helpers in the migration.
+
 ## Environment
 
 Put these in `.env.local` (git-ignored) and in your Vercel project settings:
@@ -48,6 +66,62 @@ VITE_SUPABASE_ANON_KEY=<anon or publishable key>
 > Never add `SUPABASE_SERVICE_ROLE_KEY` to anything in this repository. Any
 > `VITE_`-prefixed value is bundled into the browser. The service-role key is
 > only used by database triggers and the SQL functions, which run server-side.
+
+## Why my confirmation email sends me to localhost:3000
+
+`http://localhost:3000` is Supabase's default **Site URL**, and it is not your
+code. Two settings decide where a confirmation or recovery link lands:
+
+**1. Authentication → URL Configuration → Site URL.** This is the *default*
+redirect target used when the client does not send a `redirectTo`. It ships as
+`http://localhost:3000`. Set it to your production URL.
+
+**2. The email template.** Authentication → Emails → Templates → *Confirm
+signup*. Supabase's own note on this: when you pass a `redirectTo`, a template
+using `{{ .SiteURL }}` will ignore it. Either of these fixes it:
+
+```html
+<!-- preferred: honours redirectTo, falls back to SiteURL -->
+<a href="{{ .ConfirmationURL }}">Confirm email address</a>
+
+<!-- or the older explicit form -->
+<a href="{{ .RedirectTo }}/auth/confirm?token_hash={{ .TokenHash }}&type=email">
+  Confirm email address
+</a>
+```
+
+If the link still goes to `localhost:3000` after fixing both, the template is
+the culprit — `{{ .SiteURL }}` wins over anything the client sends.
+
+**Allowlist.** Any `redirectTo` you send must also match the Redirect URLs
+list, or Supabase ignores it and falls back to SiteURL. Ours are
+`${window.location.origin}/app/dashboard` on sign-up and
+`${window.location.origin}/reset-password` on recovery, so the list needs
+`http://localhost:5173/**`, your production domain, and the Vercel preview
+pattern.
+
+**Already-used links.** Confirmation and recovery links are single-use, and
+corporate email scanners routinely `GET` them before the user clicks. The app
+reads `error_code`/`error_description` out of the URL fragment and explains
+what happened instead of landing on a dead form.
+
+## Deploying to Vercel
+
+Three settings are separate from your local `.env.local` and are the usual
+reason a deployed build "ignores" Supabase:
+
+1. **Environment variables live in the Vercel project**, not in a file you
+   pushed. Project → Settings → Environment Variables, add both `VITE_` values
+   for Production/Preview/Development, then redeploy. If they are missing the
+   app does not crash — it silently falls back to the in-memory demo backend.
+   Look for the "Demo mode" badge on the sign-in page to tell which backend is
+   live.
+2. **Allow the redirect origins.** Authentication → URL Configuration → Redirect
+   URLs needs `http://localhost:5173/**`, your production domain, and the
+   preview pattern (`https://<project>-*.vercel.app/**`) if you test previews.
+   Without this, email confirmation and password-reset links are rejected.
+3. **SPA rewrites.** `vercel.json` in this repo rewrites unknown paths to
+   `index.html` so a hard refresh on `/app/projects/:id/board` works.
 
 ## Verifying RLS
 
@@ -79,6 +153,8 @@ Other cases worth checking:
 | Non-member reads `organization_members` for an org they are not in | `[]` |
 | Uploading to `task-attachments` with a path in another org | rejected by the storage policy |
 | Signed out user reads anything | `[]` or `401` |
+| `anon` calls `private.is_org_member(...)` | not reachable over the Data API |
+| Member A calls `public.notify()` for a non-member of the org | `42501` |
 
 The app must be verified this way; frontend tests cannot prove authorization.
 

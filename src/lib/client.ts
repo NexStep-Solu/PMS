@@ -15,8 +15,13 @@ import { createSupabaseAdapter } from './db/supabase-adapter'
 const url = import.meta.env.VITE_SUPABASE_URL as string | undefined
 const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined
 
-/** True when the app runs against the in-memory backend. */
-export const isDemoMode: boolean = !url || !anonKey
+/**
+ * True when the app runs against the in-memory backend.
+ *
+ * Forced during tests: a developer's local `.env.local` must never make the
+ * suite sign in to, or read from, their real Supabase project.
+ */
+export const isDemoMode: boolean = import.meta.env.MODE === 'test' || !url || !anonKey
 
 let instance: DatabaseClient | null = null
 

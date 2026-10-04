@@ -4,7 +4,11 @@
     "target": "es2023",
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "module": "esnext",
-    "types": ["vite/client"],
+    // `node` is here for the vitest suites under src/test (they read files and
+    // assert on source text). Browser code has no path to node builtins at
+    // runtime — Vite would fail the build — so nothing in src/ outside tests
+    // should reach for them.
+    "types": ["vite/client", "node"],
     "allowArbitraryExtensions": true,
     "skipLibCheck": true,
 

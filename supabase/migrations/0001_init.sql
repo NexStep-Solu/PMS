@@ -435,22 +435,46 @@ create index activity_logs_entity_idx on public.activity_logs (entity_type, enti
 
 -- =====================================================================
 -- Helpers
+--
+-- These live in a private, non-exposed schema and run as SECURITY DEFINER on
+-- purpose:
+--
+--   * DEFINER, so a policy on `organization_members` can call `is_org_member()`
+--     without that call re-entering `organization_members`'s own policy. With
+--     SECURITY INVOKER that self-reference recurses until Postgres aborts with
+--     "infinite recursion detected" / a max_stack_depth failure.
+--   * A private schema, because Postgres grants EXECUTE on new functions to
+--     PUBLIC — and `anon`/`authenticated` inherit that. Functions in `public`
+--     are reachable over the Data API; functions in `private` are not exposed
+--     at all. Explicit revokes/grants below are defence in depth.
+--
+-- Every function here is a pure read used inside policies, and every one is
+-- scoped to `auth.uid()`, so DEFINER widens nothing an RLS policy did not
+-- already permit for that same user.
 -- =====================================================================
 
-create or replace function public.current_user_id()
+create schema if not exists private;
+
+-- USAGE stays with `authenticated` (policies run as the querying role and must
+-- call these helpers) but never with `anon` or `PUBLIC`, so the helpers are not
+-- reachable from the Data API without a session.
+revoke all on schema private from public, anon;
+grant usage on schema private to authenticated;
+
+create or replace function private.current_user_id()
 returns uuid
 language sql
 stable
-security invoker
+security definer
 set search_path = ''
 as $$ select auth.uid() $$;
 
 -- The role the current user holds in `target_org`, or null.
-create or replace function public.org_role(target_org uuid)
+create or replace function private.org_role(target_org uuid)
 returns public.role
 language sql
 stable
-security invoker
+security definer
 set search_path = ''
 as $$
   select role
@@ -459,44 +483,44 @@ as $$
     and user_id = auth.uid()
 $$;
 
-create or replace function public.is_org_member(target_org uuid)
+create or replace function private.is_org_member(target_org uuid)
 returns boolean
 language sql
 stable
-security invoker
+security definer
 set search_path = ''
 as $$ select exists (select 1 from public.organization_members
                      where organization_id = target_org and user_id = auth.uid()) $$;
 
-create or replace function public.has_org_role(target_org uuid, allowed public.role[])
+create or replace function private.has_org_role(target_org uuid, allowed public.role[])
 returns boolean
 language sql
 stable
-security invoker
+security definer
 set search_path = ''
-as $$ select coalesce(public.org_role(target_org) = any(allowed), false) $$;
+as $$ select coalesce(private.org_role(target_org) = any(allowed), false) $$;
 
-create or replace function public.is_org_admin(target_org uuid)
+create or replace function private.is_org_admin(target_org uuid)
 returns boolean
 language sql
 stable
-security invoker
+security definer
 set search_path = ''
 as $$
-  select public.has_org_role(target_org, array['owner', 'admin']::public.role[])
+  select private.has_org_role(target_org, array['owner', 'admin']::public.role[])
 $$;
 
 /** Task visibility: org membership, narrowed to project membership for viewers. */
-create or replace function public.can_read_task(target_org uuid, target_project uuid, assignee uuid)
+create or replace function private.can_read_task(target_org uuid, target_project uuid, assignee uuid)
 returns boolean
 language sql
 stable
-security invoker
+security definer
 set search_path = ''
 as $$
   select case
-    when not public.is_org_member(target_org) then false
-    when public.org_role(target_org) = 'viewer' then
+    when not private.is_org_member(target_org) then false
+    when private.org_role(target_org) = 'viewer' then
       assignee = auth.uid()
       or exists (
         select 1 from public.project_members pm
@@ -507,16 +531,16 @@ as $$
 $$;
 
 /** Writes: members and above, plus explicit project membership. */
-create or replace function public.can_write_project(target_org uuid, target_project uuid)
+create or replace function private.can_write_project(target_org uuid, target_project uuid)
 returns boolean
 language sql
 stable
-security invoker
+security definer
 set search_path = ''
 as $$
   select case
-    when not public.is_org_member(target_org) then false
-    when public.org_role(target_org) = 'viewer' then
+    when not private.is_org_member(target_org) then false
+    when private.org_role(target_org) = 'viewer' then
       exists (
         select 1 from public.project_members pm
         where pm.project_id = target_project and pm.user_id = auth.uid()
@@ -525,17 +549,17 @@ as $$
   end
 $$;
 
-create or replace function public.can_write_task(target_org uuid, target_project uuid)
+create or replace function private.can_write_task(target_org uuid, target_project uuid)
 returns boolean
 language sql
 stable
-security invoker
+security definer
 set search_path = ''
 as $$
   select case
-    when not public.is_org_member(target_org) then false
-    when public.org_role(target_org) = 'viewer' then false
-    else public.can_write_project(target_org, target_project)
+    when not private.is_org_member(target_org) then false
+    when private.org_role(target_org) = 'viewer' then false
+    else private.can_write_project(target_org, target_project)
   end
 $$;
 
@@ -554,13 +578,20 @@ create or replace function public.record_activity(
 )
 returns uuid
 language plpgsql
-security definer
+security invoker
 set search_path = ''
 as $$
 declare
   new_id uuid;
 begin
-  if not public.is_org_member(target_org) then
+  -- SECURITY INVOKER on purpose: the `activity_logs` insert policy already
+  -- restricts this to members of `target_org`. A SECURITY DEFINER function in an
+  -- exposed schema would hand callers the creator's privileges.
+  if auth.uid() is null then
+    raise exception 'not authenticated' using errcode = '42501';
+  end if;
+
+  if not private.is_org_member(target_org) then
     raise exception 'not a member of this organization' using errcode = '42501';
   end if;
 
@@ -582,13 +613,34 @@ create or replace function public.notify(
 )
 returns uuid
 language plpgsql
-security definer
+security invoker
 set search_path = ''
 as $$
 declare
   new_id uuid;
 begin
-  if target_user = auth.uid() then return null; end if;
+  -- Guards, because SECURITY INVOKER still needs `notifications` INSERT to be
+  -- granted: without them any member could file a notification against any user
+  -- in any workspace, i.e. forge a phishing notification.
+  if auth.uid() is null then
+    raise exception 'not authenticated' using errcode = '42501';
+  end if;
+
+  if target_user is null or target_user = auth.uid() then
+    return null;
+  end if;
+
+  -- Both parties must belong to the workspace the notification is filed under.
+  if not private.is_org_member(target_org) then
+    raise exception 'not a member of this organization' using errcode = '42501';
+  end if;
+
+  if not exists (
+    select 1 from public.organization_members
+    where organization_id = target_org and user_id = target_user
+  ) then
+    raise exception 'recipient is not a member of this organization' using errcode = '42501';
+  end if;
 
   insert into public.notifications (user_id, organization_id, type, title, message, data)
   values (target_user, target_org, target_type, target_title, target_message, target_data)
@@ -598,9 +650,26 @@ begin
 end;
 $$;
 
+-- The notifications insert policy that lets `notify()` (SECURITY INVOKER) work,
+-- still scoped to notifications a member may file for a co-member.
+drop policy if exists "notifications_insert" on public.notifications;
+create policy notifications_insert on public.notifications
+  for insert to authenticated
+  with check (
+    private.is_org_member(organization_id)
+    and exists (
+      select 1 from public.organization_members m
+      where m.organization_id = notifications.organization_id
+        and m.user_id = notifications.user_id
+    )
+  );
+
 -- =====================================================================
 -- Row Level Security
 -- =====================================================================
+
+-- Nothing in `public` needs to be creatable by API roles.
+revoke create on schema public from anon, authenticated;
 
 alter table public.profiles                enable row level security;
 alter table public.organizations           enable row level security;
@@ -626,6 +695,7 @@ alter table public.activity_logs           enable row level security;
 
 -- profiles -------------------------------------------------------------
 
+drop policy if exists "profiles_select_self" on public.profiles;
 create policy profiles_select_self on public.profiles
   for select to authenticated
   using (
@@ -637,344 +707,405 @@ create policy profiles_select_self on public.profiles
     )
   );
 
+drop policy if exists "profiles_update_self" on public.profiles;
 create policy profiles_update_self on public.profiles
   for update to authenticated
   using (id = auth.uid())
   with check (id = auth.uid());
 
+drop policy if exists "profiles_insert_self" on public.profiles;
 create policy profiles_insert_self on public.profiles
   for insert to authenticated
   with check (id = auth.uid());
 
 -- organizations --------------------------------------------------------
 
+drop policy if exists "organizations_select" on public.organizations;
 create policy organizations_select on public.organizations
   for select to authenticated
-  using (public.is_org_member(id));
+  using (private.is_org_member(id));
 
+drop policy if exists "organizations_update" on public.organizations;
 create policy organizations_update on public.organizations
   for update to authenticated
-  using (public.is_org_admin(id))
-  with check (public.is_org_admin(id));
+  using (private.is_org_admin(id))
+  with check (private.is_org_admin(id));
 
+drop policy if exists "organizations_insert" on public.organizations;
 create policy organizations_insert on public.organizations
   for insert to authenticated
   with check (created_by = auth.uid());
 
+drop policy if exists "organizations_delete" on public.organizations;
 create policy organizations_delete on public.organizations
   for delete to authenticated
-  using (public.org_role(id) = 'owner');
+  using (private.org_role(id) = 'owner');
 
 -- organization_members -------------------------------------------------
 
+drop policy if exists "org_members_select" on public.organization_members;
 create policy org_members_select on public.organization_members
   for select to authenticated
-  using (public.is_org_member(organization_id));
+  using (private.is_org_member(organization_id));
 
+drop policy if exists "org_members_insert" on public.organization_members;
 create policy org_members_insert on public.organization_members
   for insert to authenticated
-  with check (public.is_org_admin(organization_id));
+  with check (private.is_org_admin(organization_id));
 
+drop policy if exists "org_members_update" on public.organization_members;
 create policy org_members_update on public.organization_members
   for update to authenticated
-  using (public.is_org_admin(organization_id))
-  with check (public.is_org_admin(organization_id));
+  using (private.is_org_admin(organization_id))
+  with check (private.is_org_admin(organization_id));
 
+drop policy if exists "org_members_delete" on public.organization_members;
 create policy org_members_delete on public.organization_members
   for delete to authenticated
   using (
-    public.is_org_admin(organization_id)
-    and not (user_id = auth.uid() and public.org_role(organization_id) = 'owner')
+    private.is_org_admin(organization_id)
+    and not (user_id = auth.uid() and private.org_role(organization_id) = 'owner')
   );
 
 -- organization_invitations --------------------------------------------
 
+drop policy if exists "invitations_select" on public.organization_invitations;
 create policy invitations_select on public.organization_invitations
   for select to authenticated
-  using (public.is_org_admin(organization_id));
+  using (private.is_org_admin(organization_id));
 
+drop policy if exists "invitations_insert" on public.organization_invitations;
 create policy invitations_insert on public.organization_invitations
   for insert to authenticated
-  with check (public.is_org_admin(organization_id) and invited_by = auth.uid());
+  with check (private.is_org_admin(organization_id) and invited_by = auth.uid());
 
+drop policy if exists "invitations_update" on public.organization_invitations;
 create policy invitations_update on public.organization_invitations
   for update to authenticated
-  using (public.is_org_admin(organization_id))
-  with check (public.is_org_admin(organization_id));
+  using (private.is_org_admin(organization_id))
+  with check (private.is_org_admin(organization_id));
 
+drop policy if exists "invitations_delete" on public.organization_invitations;
 create policy invitations_delete on public.organization_invitations
   for delete to authenticated
-  using (public.is_org_admin(organization_id));
+  using (private.is_org_admin(organization_id));
 
 -- teams ----------------------------------------------------------------
 
+drop policy if exists "teams_select" on public.teams;
 create policy teams_select on public.teams
   for select to authenticated
-  using (public.is_org_member(organization_id));
+  using (private.is_org_member(organization_id));
 
+drop policy if exists "teams_insert" on public.teams;
 create policy teams_insert on public.teams
   for insert to authenticated
-  with check (public.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]));
+  with check (private.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]));
 
+drop policy if exists "teams_update" on public.teams;
 create policy teams_update on public.teams
   for update to authenticated
-  using (public.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]))
-  with check (public.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]));
+  using (private.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]))
+  with check (private.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]));
 
+drop policy if exists "teams_delete" on public.teams;
 create policy teams_delete on public.teams
   for delete to authenticated
-  using (public.is_org_admin(organization_id));
+  using (private.is_org_admin(organization_id));
 
 -- team_members ---------------------------------------------------------
 
+drop policy if exists "team_members_select" on public.team_members;
 create policy team_members_select on public.team_members
   for select to authenticated
-  using (exists (select 1 from public.teams t where t.id = team_id and public.is_org_member(t.organization_id)));
+  using (exists (select 1 from public.teams t where t.id = team_id and private.is_org_member(t.organization_id)));
 
+drop policy if exists "team_members_write" on public.team_members;
 create policy team_members_write on public.team_members
   for all to authenticated
   using (exists (
     select 1 from public.teams t
     where t.id = team_id
-      and public.has_org_role(t.organization_id, array['owner', 'admin', 'manager']::public.role[])
+      and private.has_org_role(t.organization_id, array['owner', 'admin', 'manager']::public.role[])
   ))
   with check (exists (
     select 1 from public.teams t
     where t.id = team_id
-      and public.has_org_role(t.organization_id, array['owner', 'admin', 'manager']::public.role[])
+      and private.has_org_role(t.organization_id, array['owner', 'admin', 'manager']::public.role[])
   ));
 
 -- projects -------------------------------------------------------------
 
+drop policy if exists "projects_select" on public.projects;
 create policy projects_select on public.projects
   for select to authenticated
   using (
-    public.is_org_member(organization_id)
+    private.is_org_member(organization_id)
     and (
-      public.org_role(organization_id) <> 'viewer'
+      private.org_role(organization_id) <> 'viewer'
       or owner_id = auth.uid()
       or exists (select 1 from public.project_members pm
                  where pm.project_id = projects.id and pm.user_id = auth.uid())
     )
   );
 
+drop policy if exists "projects_insert" on public.projects;
 create policy projects_insert on public.projects
   for insert to authenticated
-  with check (public.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]));
+  with check (private.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]));
 
+drop policy if exists "projects_update" on public.projects;
 create policy projects_update on public.projects
   for update to authenticated
-  using (public.can_write_project(organization_id, id))
-  with check (public.can_write_project(organization_id, id));
+  using (private.can_write_project(organization_id, id))
+  with check (private.can_write_project(organization_id, id));
 
+drop policy if exists "projects_delete" on public.projects;
 create policy projects_delete on public.projects
   for delete to authenticated
-  using (public.has_org_role(organization_id, array['owner', 'admin']::public.role[]));
+  using (private.has_org_role(organization_id, array['owner', 'admin']::public.role[]));
 
 -- project_members ------------------------------------------------------
 
+drop policy if exists "project_members_select" on public.project_members;
 create policy project_members_select on public.project_members
   for select to authenticated
   using (exists (select 1 from public.projects p
-                 where p.id = project_id and public.is_org_member(p.organization_id)));
+                 where p.id = project_id and private.is_org_member(p.organization_id)));
 
+drop policy if exists "project_members_write" on public.project_members;
 create policy project_members_write on public.project_members
   for all to authenticated
-  using (public.can_write_project(
+  using (private.can_write_project(
     (select p.organization_id from public.projects p where p.id = project_id),
     project_id
   ))
-  with check (public.can_write_project(
+  with check (private.can_write_project(
     (select p.organization_id from public.projects p where p.id = project_id),
     project_id
   ));
 
 -- task_statuses / priorities / labels ---------------------------------
 
+drop policy if exists "statuses_select" on public.task_statuses;
 create policy statuses_select on public.task_statuses
-  for select to authenticated using (public.is_org_member(organization_id));
+  for select to authenticated using (private.is_org_member(organization_id));
+drop policy if exists "statuses_write" on public.task_statuses;
 create policy statuses_write on public.task_statuses
   for all to authenticated
-  using (public.has_org_role(organization_id, array['owner', 'admin']::public.role[]))
-  with check (public.has_org_role(organization_id, array['owner', 'admin']::public.role[]));
+  using (private.has_org_role(organization_id, array['owner', 'admin']::public.role[]))
+  with check (private.has_org_role(organization_id, array['owner', 'admin']::public.role[]));
 
+drop policy if exists "priorities_select" on public.priorities;
 create policy priorities_select on public.priorities
-  for select to authenticated using (public.is_org_member(organization_id));
+  for select to authenticated using (private.is_org_member(organization_id));
+drop policy if exists "priorities_write" on public.priorities;
 create policy priorities_write on public.priorities
   for all to authenticated
-  using (public.has_org_role(organization_id, array['owner', 'admin']::public.role[]))
-  with check (public.has_org_role(organization_id, array['owner', 'admin']::public.role[]));
+  using (private.has_org_role(organization_id, array['owner', 'admin']::public.role[]))
+  with check (private.has_org_role(organization_id, array['owner', 'admin']::public.role[]));
 
+drop policy if exists "labels_select" on public.labels;
 create policy labels_select on public.labels
-  for select to authenticated using (public.is_org_member(organization_id));
+  for select to authenticated using (private.is_org_member(organization_id));
+drop policy if exists "labels_write" on public.labels;
 create policy labels_write on public.labels
   for all to authenticated
-  using (public.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]))
-  with check (public.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]));
+  using (private.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]))
+  with check (private.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[]));
 
 -- tasks ----------------------------------------------------------------
 
+drop policy if exists "tasks_select" on public.tasks;
 create policy tasks_select on public.tasks
   for select to authenticated
-  using (public.can_read_task(organization_id, project_id, assignee_id));
+  using (private.can_read_task(organization_id, project_id, assignee_id));
 
+drop policy if exists "tasks_insert" on public.tasks;
 create policy tasks_insert on public.tasks
   for insert to authenticated
   with check (
-    public.can_write_task(organization_id, project_id)
+    private.can_write_task(organization_id, project_id)
     and reporter_id = auth.uid()
-    and public.is_org_member(organization_id)
+    and private.is_org_member(organization_id)
   );
 
+drop policy if exists "tasks_update" on public.tasks;
 create policy tasks_update on public.tasks
   for update to authenticated
-  using (public.can_write_task(organization_id, project_id))
-  with check (public.can_write_task(organization_id, project_id));
+  using (private.can_write_task(organization_id, project_id))
+  with check (private.can_write_task(organization_id, project_id));
 
+drop policy if exists "tasks_delete" on public.tasks;
 create policy tasks_delete on public.tasks
   for delete to authenticated
   using (
     reporter_id = auth.uid()
-    or public.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[])
+    or private.has_org_role(organization_id, array['owner', 'admin', 'manager']::public.role[])
   );
 
 -- task_labels ----------------------------------------------------------
 
+drop policy if exists "task_labels_select" on public.task_labels;
 create policy task_labels_select on public.task_labels
   for select to authenticated
-  using (exists (select 1 from public.tasks t where t.id = task_id and public.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
+  using (exists (select 1 from public.tasks t where t.id = task_id and private.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
 
+drop policy if exists "task_labels_write" on public.task_labels;
 create policy task_labels_write on public.task_labels
   for all to authenticated
-  using (exists (select 1 from public.tasks t where t.id = task_id and public.can_write_task(t.organization_id, t.project_id)))
-  with check (exists (select 1 from public.tasks t where t.id = task_id and public.can_write_task(t.organization_id, t.project_id)));
+  using (exists (select 1 from public.tasks t where t.id = task_id and private.can_write_task(t.organization_id, t.project_id)))
+  with check (exists (select 1 from public.tasks t where t.id = task_id and private.can_write_task(t.organization_id, t.project_id)));
 
 -- task_comments --------------------------------------------------------
 
+drop policy if exists "task_comments_select" on public.task_comments;
 create policy task_comments_select on public.task_comments
   for select to authenticated
-  using (exists (select 1 from public.tasks t where t.id = task_id and public.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
+  using (exists (select 1 from public.tasks t where t.id = task_id and private.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
 
+drop policy if exists "task_comments_insert" on public.task_comments;
 create policy task_comments_insert on public.task_comments
   for insert to authenticated
   with check (
     user_id = auth.uid()
-    and exists (select 1 from public.tasks t where t.id = task_id and public.can_read_task(t.organization_id, t.project_id, t.assignee_id))
+    and exists (select 1 from public.tasks t where t.id = task_id and private.can_read_task(t.organization_id, t.project_id, t.assignee_id))
   );
 
+drop policy if exists "task_comments_update" on public.task_comments;
 create policy task_comments_update on public.task_comments
   for update to authenticated
   using (user_id = auth.uid())
   with check (user_id = auth.uid());
 
+drop policy if exists "task_comments_delete" on public.task_comments;
 create policy task_comments_delete on public.task_comments
   for delete to authenticated
-  using (user_id = auth.uid() or public.is_org_admin((select t.organization_id from public.tasks t where t.id = task_id)));
+  using (user_id = auth.uid() or private.is_org_admin((select t.organization_id from public.tasks t where t.id = task_id)));
 
 -- task_checklists ------------------------------------------------------
 
+drop policy if exists "task_checklists_select" on public.task_checklists;
 create policy task_checklists_select on public.task_checklists
   for select to authenticated
-  using (exists (select 1 from public.tasks t where t.id = task_id and public.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
+  using (exists (select 1 from public.tasks t where t.id = task_id and private.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
 
+drop policy if exists "task_checklists_write" on public.task_checklists;
 create policy task_checklists_write on public.task_checklists
   for all to authenticated
-  using (exists (select 1 from public.tasks t where t.id = task_id and public.can_write_task(t.organization_id, t.project_id)))
-  with check (exists (select 1 from public.tasks t where t.id = task_id and public.can_write_task(t.organization_id, t.project_id)));
+  using (exists (select 1 from public.tasks t where t.id = task_id and private.can_write_task(t.organization_id, t.project_id)))
+  with check (exists (select 1 from public.tasks t where t.id = task_id and private.can_write_task(t.organization_id, t.project_id)));
 
 -- attachments ----------------------------------------------------------
 
+drop policy if exists "task_attachments_select" on public.task_attachments;
 create policy task_attachments_select on public.task_attachments
   for select to authenticated
-  using (exists (select 1 from public.tasks t where t.id = task_id and public.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
+  using (exists (select 1 from public.tasks t where t.id = task_id and private.can_read_task(t.organization_id, t.project_id, t.assignee_id)));
 
+drop policy if exists "task_attachments_insert" on public.task_attachments;
 create policy task_attachments_insert on public.task_attachments
   for insert to authenticated
   with check (
     uploaded_by = auth.uid()
-    and exists (select 1 from public.tasks t where t.id = task_id and public.can_write_task(t.organization_id, t.project_id))
+    and exists (select 1 from public.tasks t where t.id = task_id and private.can_write_task(t.organization_id, t.project_id))
   );
 
+drop policy if exists "task_attachments_delete" on public.task_attachments;
 create policy task_attachments_delete on public.task_attachments
   for delete to authenticated
   using (
     uploaded_by = auth.uid()
-    or exists (select 1 from public.tasks t where t.id = task_id and public.can_write_task(t.organization_id, t.project_id))
+    or exists (select 1 from public.tasks t where t.id = task_id and private.can_write_task(t.organization_id, t.project_id))
   );
 
+drop policy if exists "project_files_select" on public.project_files;
 create policy project_files_select on public.project_files
   for select to authenticated
-  using (exists (select 1 from public.projects p where p.id = project_id and public.is_org_member(p.organization_id)));
+  using (exists (select 1 from public.projects p where p.id = project_id and private.is_org_member(p.organization_id)));
 
+drop policy if exists "project_files_insert" on public.project_files;
 create policy project_files_insert on public.project_files
   for insert to authenticated
   with check (
     uploaded_by = auth.uid()
-    and exists (select 1 from public.projects p where p.id = project_id and public.can_write_project(p.organization_id, p.id))
+    and exists (select 1 from public.projects p where p.id = project_id and private.can_write_project(p.organization_id, p.id))
   );
 
+drop policy if exists "project_files_delete" on public.project_files;
 create policy project_files_delete on public.project_files
   for delete to authenticated
   using (
     uploaded_by = auth.uid()
-    or exists (select 1 from public.projects p where p.id = project_id and public.can_write_project(p.organization_id, p.id))
+    or exists (select 1 from public.projects p where p.id = project_id and private.can_write_project(p.organization_id, p.id))
   );
 
 -- milestones -----------------------------------------------------------
 
+drop policy if exists "milestones_select" on public.milestones;
 create policy milestones_select on public.milestones
   for select to authenticated
-  using (public.can_read_task(organization_id, project_id, auth.uid()));
+  using (private.can_read_task(organization_id, project_id, auth.uid()));
 
+drop policy if exists "milestones_write" on public.milestones;
 create policy milestones_write on public.milestones
   for all to authenticated
-  using (public.can_write_task(organization_id, project_id))
-  with check (public.can_write_task(organization_id, project_id));
+  using (private.can_write_task(organization_id, project_id))
+  with check (private.can_write_task(organization_id, project_id));
 
 -- time_entries ---------------------------------------------------------
 
+drop policy if exists "time_entries_select" on public.time_entries;
 create policy time_entries_select on public.time_entries
   for select to authenticated
   using (
-    public.is_org_member(organization_id)
-    and (user_id = auth.uid() or public.org_role(organization_id) <> 'viewer')
+    private.is_org_member(organization_id)
+    and (user_id = auth.uid() or private.org_role(organization_id) <> 'viewer')
   );
 
+drop policy if exists "time_entries_insert" on public.time_entries;
 create policy time_entries_insert on public.time_entries
   for insert to authenticated
-  with check (user_id = auth.uid() and public.can_write_project(organization_id, project_id));
+  with check (user_id = auth.uid() and private.can_write_project(organization_id, project_id));
 
+drop policy if exists "time_entries_update" on public.time_entries;
 create policy time_entries_update on public.time_entries
   for update to authenticated
-  using (user_id = auth.uid() or public.is_org_admin(organization_id))
-  with check (user_id = auth.uid() or public.is_org_admin(organization_id));
+  using (user_id = auth.uid() or private.is_org_admin(organization_id))
+  with check (user_id = auth.uid() or private.is_org_admin(organization_id));
 
+drop policy if exists "time_entries_delete" on public.time_entries;
 create policy time_entries_delete on public.time_entries
   for delete to authenticated
-  using (user_id = auth.uid() or public.is_org_admin(organization_id));
+  using (user_id = auth.uid() or private.is_org_admin(organization_id));
 
 -- notifications --------------------------------------------------------
 
+drop policy if exists "notifications_select" on public.notifications;
 create policy notifications_select on public.notifications
   for select to authenticated using (user_id = auth.uid());
 
+drop policy if exists "notifications_update" on public.notifications;
 create policy notifications_update on public.notifications
   for update to authenticated
   using (user_id = auth.uid())
   with check (user_id = auth.uid());
 
+drop policy if exists "notifications_delete" on public.notifications;
 create policy notifications_delete on public.notifications
   for delete to authenticated using (user_id = auth.uid());
 
 -- activity_logs --------------------------------------------------------
 
+drop policy if exists "activity_logs_select" on public.activity_logs;
 create policy activity_logs_select on public.activity_logs
   for select to authenticated
-  using (public.is_org_member(organization_id));
+  using (private.is_org_member(organization_id));
 
+drop policy if exists "activity_logs_insert" on public.activity_logs;
 create policy activity_logs_insert on public.activity_logs
   for insert to authenticated
-  with check (public.is_org_member(organization_id));
+  with check (private.is_org_member(organization_id));
 
 -- =====================================================================
 -- Realtime
@@ -996,7 +1127,7 @@ values ('avatars', 'avatars', true),
 on conflict (id) do nothing;
 
 -- Objects live at  organizations/{orgId}/projects/{projectId}/...
-create or replace function public.storage_org_id(object_name text)
+create or replace function private.storage_org_id(object_name text)
 returns uuid
 language plpgsql
 immutable
@@ -1012,37 +1143,45 @@ begin
 end;
 $$;
 
+drop policy if exists "storage_avatars_read" on storage.objects;
 create policy storage_avatars_read on storage.objects
   for select to authenticated
   using (bucket_id = 'avatars');
 
+drop policy if exists "storage_avatars_write" on storage.objects;
 create policy storage_avatars_write on storage.objects
   for insert to authenticated
   with check (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
 
+drop policy if exists "storage_project_files_read" on storage.objects;
 create policy storage_project_files_read on storage.objects
   for select to authenticated
-  using (bucket_id = 'project-files' and public.is_org_member(public.storage_org_id(name)));
+  using (bucket_id = 'project-files' and private.is_org_member(private.storage_org_id(name)));
 
+drop policy if exists "storage_project_files_write" on storage.objects;
 create policy storage_project_files_write on storage.objects
   for insert to authenticated
-  with check (bucket_id = 'project-files' and public.is_org_member(public.storage_org_id(name)));
+  with check (bucket_id = 'project-files' and private.is_org_member(private.storage_org_id(name)));
 
+drop policy if exists "storage_project_files_delete" on storage.objects;
 create policy storage_project_files_delete on storage.objects
   for delete to authenticated
-  using (bucket_id = 'project-files' and public.is_org_member(public.storage_org_id(name)));
+  using (bucket_id = 'project-files' and private.is_org_member(private.storage_org_id(name)));
 
+drop policy if exists "storage_attachments_read" on storage.objects;
 create policy storage_attachments_read on storage.objects
   for select to authenticated
-  using (bucket_id = 'task-attachments' and public.is_org_member(public.storage_org_id(name)));
+  using (bucket_id = 'task-attachments' and private.is_org_member(private.storage_org_id(name)));
 
+drop policy if exists "storage_attachments_write" on storage.objects;
 create policy storage_attachments_write on storage.objects
   for insert to authenticated
-  with check (bucket_id = 'task-attachments' and public.is_org_member(public.storage_org_id(name)));
+  with check (bucket_id = 'task-attachments' and private.is_org_member(private.storage_org_id(name)));
 
+drop policy if exists "storage_attachments_delete" on storage.objects;
 create policy storage_attachments_delete on storage.objects
   for delete to authenticated
-  using (bucket_id = 'task-attachments' and public.is_org_member(public.storage_org_id(name)));
+  using (bucket_id = 'task-attachments' and private.is_org_member(private.storage_org_id(name)));
 
 -- =====================================================================
 -- Workspace defaults
@@ -1099,3 +1238,57 @@ begin
   end loop;
 end;
 $$;
+-- =====================================================================
+-- Function execution hardening
+--
+-- Postgres grants EXECUTE on every new function to PUBLIC, which `anon` and
+-- `authenticated` inherit. That makes any function in an exposed schema a
+-- public endpoint, so lock down the ones that do real work: only a signed-in
+-- member may call them, and trigger helpers are not callable at all.
+-- =====================================================================
+
+revoke execute on function
+  public.record_activity(uuid, text, uuid, text, jsonb),
+  public.notify(uuid, uuid, text, text, text, jsonb)
+  from public, anon;
+
+grant execute on function
+  public.record_activity(uuid, text, uuid, text, jsonb),
+  public.notify(uuid, uuid, text, text, text, jsonb)
+  to authenticated;
+
+-- Trigger helpers: called by the trigger, never directly.
+revoke execute on function
+  public.handle_new_user(),
+  public.handle_new_organization(),
+  public.set_updated_at(),
+  public.seed_workspace_defaults(uuid)
+  from public, anon, authenticated;
+
+-- Called from storage policies, so `authenticated` does need it. It only
+-- parses a path segment.
+revoke execute on function private.storage_org_id(text) from public, anon;
+grant execute on function private.storage_org_id(text) to authenticated;
+
+-- Helpers used inside RLS policies.
+revoke execute on function
+  private.current_user_id(),
+  private.org_role(uuid),
+  private.is_org_member(uuid),
+  private.has_org_role(uuid, public.role[]),
+  private.is_org_admin(uuid),
+  private.can_read_task(uuid, uuid, uuid),
+  private.can_write_project(uuid, uuid),
+  private.can_write_task(uuid, uuid)
+  from public, anon;
+
+grant execute on function
+  private.current_user_id(),
+  private.org_role(uuid),
+  private.is_org_member(uuid),
+  private.has_org_role(uuid, public.role[]),
+  private.is_org_admin(uuid),
+  private.can_read_task(uuid, uuid, uuid),
+  private.can_write_project(uuid, uuid),
+  private.can_write_task(uuid, uuid)
+  to authenticated;

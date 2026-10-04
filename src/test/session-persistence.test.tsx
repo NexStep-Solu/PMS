@@ -7,6 +7,7 @@ import { queryClient } from '@/app/query-client'
 import { resetDbClient } from '@/lib/client'
 import { safeRedirectPath } from '@/lib/redirects'
 import { createDemoClient } from '@/lib/db/mock/client'
+import { isDemoMode } from '@/lib/client'
 
 beforeEach(() => {
   queryClient.clear()
@@ -39,6 +40,12 @@ describe('safeRedirectPath', () => {
     expect(safeRedirectPath('/login')).toBe('/app/dashboard')
     expect(safeRedirectPath('/register')).toBe('/app/dashboard')
     expect(safeRedirectPath(null)).toBe('/app/dashboard')
+  })
+})
+
+describe('hermetic test environment', () => {
+  it('ignores a local .env.local so tests never touch a real project', () => {
+    expect(isDemoMode).toBe(true)
   })
 })
 
