@@ -12,6 +12,8 @@ export const keys = {
 
   members: (org: string) => ['org', org, 'members'] as const,
   invitations: (org: string) => ['org', org, 'invitations'] as const,
+  report: (org: string) => ['org', org, 'report'] as const,
+  invitationPreview: (token: string) => ['invitation', token] as const,
   teams: (org: string) => ['org', org, 'teams'] as const,
   teamMembers: (teamId: string) => ['team', teamId, 'members'] as const,
   organization: (org: string) => ['org', org] as const,

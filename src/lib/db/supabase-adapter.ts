@@ -21,40 +21,49 @@ import type {
   TableRef,
 } from './contract'
 
-function mapError(error: unknown, fallback: 'database' | 'upload' = 'database'): AppError {
+/**
+ * Retags anything that came back from Postgres as `source: 'database'` so the
+ * UI never renders raw SQL. Fields already set by `toAppError` — notably
+ * `userMessage` — are carried through untouched.
+ */
+export function mapError(error: unknown, fallback: 'database' | 'upload' = 'database'): AppError {
   const normalised = toAppError(error, fallback)
-  if (normalised.kind === 'unknown') {
-    return new AppError('database', normalised.message, {
-      code: normalised.code,
-      details: normalised.details,
-    })
-  }
-  return new AppError(normalised.kind, normalised.message, {
+  const kind = normalised.kind === 'unknown' ? 'database' : normalised.kind
+
+  return new AppError(kind, normalised.message, {
     code: normalised.code,
     details: normalised.details,
+    hint: normalised.hint,
+    source: 'database',
+    userMessage: normalised.userMessage,
   })
 }
 
 function mapAuthError(error: unknown): AppError | null {
   if (!error) return null
+  const asAuth = (message: string, code: string) => new AppError('validation', message, { code, source: 'auth' })
   const code = typeof error === 'object' && error !== null && 'code' in error ? String((error as { code: unknown }).code) : null
   const message = error instanceof Error ? error.message : 'Authentication failed.'
   if (code === 'invalid_credentials') {
-    return new AppError('validation', 'Incorrect email or password.', { code })
+    return asAuth('Incorrect email or password.', code)
   }
   if (code === 'email_not_confirmed') {
-    return new AppError('validation', 'Please confirm your email address before signing in.', { code })
+    return asAuth('Please confirm your email address before signing in.', code)
   }
   if (code === 'user_already_exists' || code === 'email_exists') {
-    return new AppError('conflict', 'An account with this email already exists.', { code })
+    return new AppError('conflict', 'An account with this email already exists.', { code, source: 'auth' })
   }
   if (code === 'weak_password') {
-    return new AppError('validation', 'Password is too weak. Use at least 8 characters.', { code })
+    return asAuth('Password is too weak. Use at least 8 characters.', code)
   }
   if (code === 'over_request_rate_limit' || code === 'over_email_send_rate_limit') {
-    return new AppError('validation', 'Too many attempts. Please wait a moment and try again.', { code })
+    return asAuth('Too many attempts. Please wait a moment and try again.', code)
   }
-  return new AppError(kindFromCode(code) === 'unknown' ? 'validation' : kindFromCode(code), message, { code })
+  return new AppError(
+    kindFromCode(code) === 'unknown' ? 'validation' : kindFromCode(code),
+    message,
+    { code, source: 'auth' },
+  )
 }
 
 function mapUser(user: unknown): AuthUser | null {
@@ -273,5 +282,17 @@ export function createSupabaseAdapter(supabase: SupabaseClient): DatabaseClient 
     },
   }
 
-  return { from, auth, storage, realtime } satisfies DatabaseClient
+  /**
+   * SECURITY DEFINER Postgres functions. Errors come back as plain objects, so
+   * they go through `mapError` like any other database response — that is what
+   * turns `raise exception 'This invitation is no longer valid.'` into a message
+   * a person can read.
+   */
+  const rpc = async <T,>(fn: string, args?: Record<string, unknown>) => {
+    const res = await supabase.rpc(fn, args ?? {})
+    if (res.error) return { data: null as T, error: mapError(res.error) }
+    return { data: (res.data ?? null) as T, error: null }
+  }
+
+  return { from, rpc, auth, storage, realtime } satisfies DatabaseClient
 }

@@ -6,6 +6,7 @@ import { keys } from '@/lib/query-keys'
 import type { Milestone, MilestoneStatus } from '@/types/database'
 
 import { recordActivity } from '@/features/activity/queries'
+import { nullable } from '@/lib/utils'
 import { useWorkspace } from '@/features/organizations/workspace-context'
 
 import type { MilestoneValues } from '@/features/tasks/schemas'
@@ -38,7 +39,7 @@ export function useCreateMilestone(projectId: string) {
           organization_id: organizationId as string,
           project_id: projectId,
           name: values.name,
-          description: values.description || null,
+          description: nullable(values.description),
           due_date: values.dueDate,
           status: values.status,
           position: 0,
@@ -76,7 +77,7 @@ export function useUpdateMilestone(projectId: string) {
     }: { milestoneId: string } & Partial<MilestoneValues>) => {
       const patch: Record<string, unknown> = {}
       if (changes.name !== undefined) patch.name = changes.name
-      if (changes.description !== undefined) patch.description = changes.description || null
+      if (changes.description !== undefined) patch.description = nullable(changes.description)
       if (changes.dueDate !== undefined) patch.due_date = changes.dueDate
       if (changes.status !== undefined) patch.status = changes.status
 

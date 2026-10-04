@@ -42,12 +42,15 @@ const ICONS: Record<NotificationType, LucideIcon> = {
 export function NotificationBell() {
   const user = useCurrentUser()
   const navigate = useNavigate()
-  const { data } = useNotifications(user?.id, 15)
+  // The badge counts *all* unread, not just the page on screen, so the count
+  // query is separate from the preview list.
+  const { data: recent } = useNotifications(user?.id, { limit: 15 })
+  const { data: unreadCount } = useNotifications(user?.id, { limit: 1 })
   const markRead = useMarkNotificationRead()
   const markAll = useMarkAllNotificationsRead(user?.id)
 
-  const items = data ?? []
-  const unread = items.filter((item) => !item.read_at)
+  const items = recent?.rows ?? []
+  const unread = unreadCount ? unreadCount.total - unreadCount.rows.filter((i) => i.read_at).length : 0
 
   return (
     <Popover>
@@ -56,15 +59,15 @@ export function NotificationBell() {
           variant="ghost"
           size="icon"
           className="relative"
-          aria-label={unread.length > 0 ? `Notifications, ${unread.length} unread` : 'Notifications'}
+          aria-label={unread > 0 ? `Notifications, ${unread} unread` : 'Notifications'}
         >
           <Bell className="size-4" aria-hidden />
-          {unread.length > 0 ? (
+          {unread > 0 ? (
             <span
               className="absolute top-1.5 right-1.5 flex min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] leading-4 font-semibold text-primary-foreground tabular"
               aria-hidden
             >
-              {unread.length > 9 ? '9+' : unread.length}
+              {unread > 9 ? '9+' : unread}
             </span>
           ) : null}
         </Button>
@@ -73,7 +76,7 @@ export function NotificationBell() {
       <PopoverContent align="end" className="w-88 p-0">
         <div className="flex items-center justify-between border-b px-3 py-2">
           <span className="text-sm font-medium">Notifications</span>
-          {unread.length > 0 ? (
+          {unread > 0 ? (
             <Button
               variant="ghost"
               size="sm"

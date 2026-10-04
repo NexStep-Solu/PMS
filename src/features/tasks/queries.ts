@@ -14,16 +14,29 @@ import type {
 import { notify, recordActivity } from '@/features/activity/queries'
 import { useWorkspace } from '@/features/organizations/workspace-context'
 
+import { taskChanges, taskPatch } from './patch'
 import type { CreateTaskValues, UpdateTaskValues } from './schemas'
 import type { TaskWithMeta } from './utils'
 
 export type { TaskWithMeta }
+
+/**
+ * Upper bound on rows pulled into the browser for a project-scoped view.
+ *
+ * The task list filters and sorts across status, assignee, due state and free
+ * text, which PostgREST cannot express as one query, so filtering happens in the
+ * browser. Capping the read keeps that honest: a pathological project degrades
+ * into a truncated list rather than an unresponsive tab. Raise it if you need
+ * deeper client-side filtering.
+ */
+export const TASK_WINDOW = 500
 
 const TASK_SELECT = `
   *,
   status:task_statuses!tasks_status_id_fkey(*),
   priority:priorities!tasks_priority_id_fkey(*),
   assignee:profiles!tasks_assignee_id_fkey(id, full_name, avatar_url),
+  project:projects!tasks_project_id_fkey(id, name, key),
   labels:task_labels(label:labels(*))
 `
 
@@ -41,6 +54,7 @@ export function useTasksByProject(projectId: string | undefined) {
         .select(TASK_SELECT)
         .eq('project_id', projectId as string)
         .order('position')
+        .limit(TASK_WINDOW)
 
       if (error) throw error
       return normalise(data as unknown as TaskWithMeta[])
@@ -58,6 +72,7 @@ export function useTasksByOrganization(organizationId: string | undefined) {
         .select(TASK_SELECT)
         .eq('organization_id', organizationId as string)
         .order('due_date')
+        .limit(TASK_WINDOW)
 
       if (error) throw error
       return normalise(data as unknown as TaskWithMeta[])
@@ -101,18 +116,29 @@ export function useSearchTasks(organizationId: string | null, term: string) {
   })
 }
 
-export function useComments(taskId: string | undefined) {
+export function useComments(
+  taskId: string | undefined,
+  options: { page?: number; pageSize?: number } = {},
+) {
+  const page = options.page ?? 1
+  const pageSize = options.pageSize ?? 25
+
   return useQuery({
-    queryKey: keys.comments(taskId ?? 'none'),
+    queryKey: [...keys.comments(taskId ?? 'none'), { page, pageSize }],
     enabled: Boolean(taskId),
-    queryFn: async () => {
-      const { data, error } = await db()
+    queryFn: async (): Promise<{ rows: TaskComment[]; total: number }> => {
+      const from = (page - 1) * pageSize
+      const { data, error, count } = await db()
         .from('task_comments')
-        .select('*, profiles!task_comments_user_id_fkey(id, full_name, avatar_url)')
+        .select('*, profiles!task_comments_user_id_fkey(id, full_name, avatar_url)', {
+          count: 'exact',
+        })
         .eq('task_id', taskId as string)
         .order('created_at')
+        .range(from, from + pageSize - 1)
       if (error) throw error
-      return data as unknown as TaskComment[]
+      const rows = (data ?? []) as unknown as TaskComment[]
+      return { rows, total: count ?? rows.length }
     },
   })
 }
@@ -208,6 +234,7 @@ function normalise(tasks: TaskWithMeta[]): TaskWithMeta[] {
     status: task.status ?? ({ name: 'Unknown', category: 'todo', is_completed: false } as TaskStatus),
     priority: task.priority ?? null,
     assignee: task.assignee ?? null,
+    project: task.project ?? null,
     labels: task.labels ?? [],
   }))
 }
@@ -222,26 +249,12 @@ export function useCreateTask() {
 
   return useMutation({
     mutationFn: async (values: CreateTaskValues & { userId: string; position?: number }) => {
-      const { labelIds, ...rest } = values
+      const { labelIds, userId, position, ...rest } = values
       const resolvedLabelIds = labelIds ?? []
 
       const { data, error } = await db()
         .from('tasks')
-        .insert({
-          organization_id: organizationId as string,
-          project_id: rest.projectId,
-          parent_task_id: rest.parentTaskId ?? null,
-          title: rest.title,
-          description: rest.description || null,
-          status_id: rest.statusId,
-          priority_id: rest.priorityId ?? null,
-          assignee_id: rest.assigneeId ?? null,
-          reporter_id: rest.userId,
-          start_date: rest.startDate || null,
-          due_date: rest.dueDate || null,
-          estimated_minutes: rest.estimatedMinutes ?? null,
-          position: rest.position ?? 1000,
-        })
+        .insert(taskPatch({ ...values, userId, position }, organizationId as string) as never)
         .select('id')
         .single()
       if (error) throw error
@@ -267,7 +280,7 @@ export function useCreateTask() {
           userId: rest.assigneeId,
           organizationId: organizationId as string,
           type: 'task_assigned',
-          title: `You were assigned "${rest.title}"`,
+          title: `You were assigned "${values.title}"`,
           data: { task_id: data.id, project_id: rest.projectId },
         })
       }
@@ -289,24 +302,13 @@ export function useUpdateTask(taskId?: string) {
   return useMutation({
     mutationFn: async (values: UpdateTaskValues & { task: TaskWithMeta }) => {
       const targetId = taskId ?? values.task.id
-      const { labelIds, task, ...rest } = values
-      void rest.projectId
+      const { labelIds, task, statusId } = values
+      const patch = taskChanges(values)
 
-      const patch: Record<string, unknown> = {}
-      if (rest.title !== undefined) patch.title = rest.title
-      if (rest.description !== undefined) patch.description = rest.description || null
-      if (rest.statusId !== undefined) patch.status_id = rest.statusId
-      if (rest.priorityId !== undefined) patch.priority_id = rest.priorityId
-      if (rest.assigneeId !== undefined) patch.assignee_id = rest.assigneeId
-      if (rest.startDate !== undefined) patch.start_date = rest.startDate || null
-      if (rest.dueDate !== undefined) patch.due_date = rest.dueDate || null
-      if (rest.estimatedMinutes !== undefined) patch.estimated_minutes = rest.estimatedMinutes
-      if (rest.position !== undefined) patch.position = rest.position
-      if (rest.parentTaskId !== undefined) patch.parent_task_id = rest.parentTaskId
-      if (rest.projectId !== undefined) patch.project_id = rest.projectId
-
-      if (task?.status && rest.statusId && task.status_id !== rest.statusId) {
-        const isNowCompleted = await isCompletedStatus(rest.statusId)
+      // Crossing into a completed status stamps completed_at, and leaving it
+      // clears the stamp.
+      if (statusId && task.status_id !== statusId) {
+        const isNowCompleted = await isCompletedStatus(statusId)
         patch.completed_at = isNowCompleted ? new Date().toISOString() : null
       }
 

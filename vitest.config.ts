@@ -16,8 +16,13 @@ export default defineConfig({
     css: false,
     include: ['src/**/*.{test,spec}.{ts,tsx}'],
     // The demo backend has realistic latency and the flow tests mount the whole
-    // app, so give them room.
-    testTimeout: 30_000,
-    hookTimeout: 30_000,
+    // app in jsdom, which gets expensive when every file runs in parallel. A
+    // 30s budget failed intermittently on slow machines for no functional reason.
+    testTimeout: 90_000,
+    hookTimeout: 90_000,
+    // Most files mount the whole app in jsdom. Running them concurrently starves
+    // each other badly enough that timeouts fire on healthy code, so the suite is
+    // serialised. It is slower in wall-clock but deterministic.
+    fileParallelism: false,
   },
 })

@@ -128,6 +128,20 @@ begin
   )
   on conflict (id) do nothing;
 
+  -- Signing up through an invitation link joins that workspace. Otherwise every
+  -- signup would also mint a personal workspace, leaving the invitee with two and
+  -- the new one empty.
+  if nullif(new.raw_user_meta_data ->> 'invite_token', '') is not null then
+    begin
+      perform public.accept_invitation((new.raw_user_meta_data ->> 'invite_token')::uuid);
+      return new;
+    exception when others then
+      -- Fall through to a personal workspace: a stale or mistyped link must never
+      -- leave someone unable to sign up at all.
+      null;
+    end;
+  end if;
+
   base_slug := lower(regexp_replace(coalesce(new.raw_user_meta_data ->> 'organization_name', 'workspace'), '[^a-zA-Z0-9]+', '-', 'g'))
              || '-' || substr(replace(new.id::text, '-', ''), 1, 6);
 
@@ -690,6 +704,125 @@ as $$
   select private.has_org_role(target_org, array['owner', 'admin']::public.role[])
 $$;
 
+-- ---------------------------------------------------------------------
+-- Invitations
+--
+-- A signup always needs a workspace, but an invited user must *join* the one
+-- they were invited to rather than get a second, empty one. Both paths resolve
+-- through the token so the two flows cannot drift.
+-- ---------------------------------------------------------------------
+
+create or replace function private.current_user_email()
+returns citext
+language sql
+stable
+set search_path = ''
+as $$
+  select nullif(auth.jwt() ->> 'email', '')::citext
+$$;
+
+create or replace function private.invitation_for_token(p_token uuid)
+returns public.organization_invitations
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select i.*
+  from public.organization_invitations i
+  where i.token = p_token
+    and i.status = 'pending'
+    and i.expires_at > now()
+$$;
+
+/**
+ * Joins the caller to the organisation that issued the token.
+ *
+ * SECURITY DEFINER because the caller is, by definition, not yet a member and so
+ * cannot pass the organization_members policies. Every guard is inside: the
+ * token must be live, and the caller's verified email must be the invited one.
+ * That last check is what stops anyone with a valid link from walking into a
+ * workspace they were not invited to.
+ */
+create or replace function public.accept_invitation(p_token uuid)
+returns table (organization_id uuid, organization_name text, role public.role)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  invite public.organization_invitations;
+  caller_email citext;
+  member_role public.role;
+begin
+  if p_token is null then
+    raise exception 'Invitation not found' using errcode = 'no_data_found';
+  end if;
+
+  select * into invite from private.invitation_for_token(p_token);
+
+  if invite.id is null then
+    raise exception 'This invitation is no longer valid.' using errcode = 'no_data_found';
+  end if;
+
+  caller_email := private.current_user_email();
+
+  if caller_email is null or invite.email <> caller_email then
+    raise exception 'This invitation was sent to %.' , invite.email
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  member_role := invite.role;
+
+  insert into public.organization_members (organization_id, user_id, role)
+  values (invite.organization_id, auth.uid(), member_role)
+  on conflict (organization_id, user_id) do update set role = excluded.role;
+
+  update public.organization_invitations
+  set status = 'accepted', accepted_at = now()
+  where id = invite.id;
+
+  return query
+    select o.id, o.name, member_role
+    from public.organizations o
+    where o.id = invite.organization_id;
+end;
+$$;
+
+/** Enough to render "You have been invited to <workspace> as <role>". */
+create or replace function public.invitation_preview(p_token uuid)
+returns table (
+  organization_name text,
+  invited_email citext,
+  role public.role,
+  invited_by text,
+  is_valid boolean,
+  status public.invitation_status
+)
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select
+    o.name,
+    i.email,
+    i.role,
+    coalesce(p.full_name, 'A teammate'),
+    (i.status = 'pending' and i.expires_at > now()),
+    i.status
+  from public.organization_invitations i
+  join public.organizations o on o.id = i.organization_id
+  left join public.profiles p on p.id = i.invited_by
+  where i.token = p_token
+$$;
+
+revoke all on function public.accept_invitation(uuid) from public;
+grant execute on function public.accept_invitation(uuid) to authenticated;
+grant execute on function public.invitation_preview(uuid) to authenticated, anon;
+
+
+
 /** Task visibility: org membership, narrowed to project membership for viewers. */
 -- Lookups used by policies on child tables. SECURITY DEFINER for the same
 -- reason as the helpers above: `project_members_select` must be able to ask
@@ -820,7 +953,10 @@ as $$
   select case
     when not private.is_org_member(target_org) then false
     when private.org_role(target_org) = 'viewer' then
-      assignee = auth.uid()
+      -- A task with no project belongs to no project team, so there is no
+      -- membership to check; it is visible to the whole workspace.
+      target_project is null
+      or assignee = auth.uid()
       or exists (
         select 1 from public.project_members pm
         where pm.project_id = target_project and pm.user_id = auth.uid()
@@ -1063,7 +1199,11 @@ create policy org_members_delete on public.organization_members
 drop policy if exists "invitations_select" on public.organization_invitations;
 create policy invitations_select on public.organization_invitations
   for select to authenticated
-  using (private.is_org_admin(organization_id));
+  using (
+    private.is_org_admin(organization_id)
+    -- The invitee needs to see their own invitation before they are a member.
+    or (email = private.current_user_email() and status = 'pending')
+  );
 
 drop policy if exists "invitations_insert" on public.organization_invitations;
 create policy invitations_insert on public.organization_invitations
@@ -1073,7 +1213,7 @@ create policy invitations_insert on public.organization_invitations
 drop policy if exists "invitations_update" on public.organization_invitations;
 create policy invitations_update on public.organization_invitations
   for update to authenticated
-  using (private.is_org_admin(organization_id))
+  using (private.is_org_admin(organization_id) and status <> 'accepted')
   with check (private.is_org_admin(organization_id));
 
 drop policy if exists "invitations_delete" on public.organization_invitations;
@@ -1411,6 +1551,75 @@ values ('avatars', 'avatars', true),
 on conflict (id) do nothing;
 
 -- Objects live at  organizations/{orgId}/projects/{projectId}/...
+-- ---------------------------------------------------------------------
+-- Reporting
+--
+-- The reports screen used to download every task in the workspace and fold it
+-- into charts in the browser, so its cost grew linearly with the data. These
+-- aggregate in Postgres instead: one row per task-shape the charts need.
+-- ---------------------------------------------------------------------
+
+create or replace function public.workspace_report(p_org uuid)
+returns table (
+  project_id uuid,
+  project_key text,
+  status_id uuid,
+  priority_id uuid,
+  assignee_id uuid,
+  total bigint,
+  done bigint,
+  in_progress bigint,
+  overdue bigint
+)
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select
+    t.project_id,
+    p.key,
+    t.status_id,
+    t.priority_id,
+    t.assignee_id,
+    count(*)::bigint,
+    count(*) filter (where s.is_completed and s.category <> 'cancelled')::bigint,
+    count(*) filter (where s.category = 'in_progress')::bigint,
+    count(*) filter (
+      where t.due_date < current_date
+        and not s.is_completed
+        and s.category <> 'cancelled'
+    )::bigint
+  from public.tasks t
+  join public.task_statuses s on s.id = t.status_id
+  left join public.projects p on p.id = t.project_id
+  where t.organization_id = p_org
+    and private.is_org_member(p_org)
+    -- Same visibility rule as tasks_select, so the numbers match the lists.
+    and private.can_read_task(t.organization_id, t.project_id, t.assignee_id)
+  group by t.project_id, p.key, t.status_id, t.priority_id, t.assignee_id
+$$;
+
+create or replace function public.workspace_time_total(p_org uuid)
+returns table (tracked_minutes bigint, running_entries bigint, logged_entries bigint)
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select
+    coalesce(sum(t.duration_minutes) filter (where not t.is_running), 0)::bigint,
+    count(*) filter (where t.is_running)::bigint,
+    count(*) filter (where not t.is_running)::bigint
+  from public.time_entries t
+  where t.organization_id = p_org and private.is_org_member(p_org)
+$$;
+
+revoke all on function public.workspace_report(uuid) from public;
+revoke all on function public.workspace_time_total(uuid) from public;
+grant execute on function public.workspace_report(uuid) to authenticated;
+grant execute on function public.workspace_time_total(uuid) to authenticated;
+
 create or replace function private.storage_org_id(object_name text)
 returns uuid
 language plpgsql

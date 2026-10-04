@@ -7,6 +7,7 @@ import { keys } from '@/lib/query-keys'
 import type { TimeEntry } from '@/types/database'
 
 import { recordActivity } from '@/features/activity/queries'
+import { nullable } from '@/lib/utils'
 import { useWorkspace } from '@/features/organizations/workspace-context'
 
 export function useTimeEntries(organizationId: string | undefined) {
@@ -62,10 +63,10 @@ export function useStartTimer() {
         .insert({
           organization_id: organizationId as string,
           project_id: projectId,
-          task_id: taskId ?? null,
+          task_id: nullable(taskId),
           user_id: userId,
           started_at: new Date().toISOString(),
-          description: description ?? null,
+          description: nullable(description),
           is_running: true,
         })
         .select('*')
@@ -125,12 +126,12 @@ export function useCreateTimeEntry() {
       const { error } = await db().from('time_entries').insert({
         organization_id: organizationId as string,
         project_id: values.projectId,
-        task_id: values.taskId ?? null,
+        task_id: nullable(values.taskId),
         user_id: values.userId,
         started_at: values.startedAt,
         ended_at: new Date(new Date(values.startedAt).getTime() + values.durationMinutes * 60_000).toISOString(),
         duration_minutes: values.durationMinutes,
-        description: values.description ?? null,
+        description: nullable(values.description),
         is_running: false,
       })
       if (error) throw error

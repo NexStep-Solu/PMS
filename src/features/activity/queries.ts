@@ -4,6 +4,7 @@ import { db } from '@/lib/client'
 import { keys } from '@/lib/query-keys'
 import type { ActivityAction, ActivityLog, EntityType, NotificationType } from '@/types/database'
 
+import { nullable } from '@/lib/utils'
 import { useWorkspace } from '@/features/organizations/workspace-context'
 
 /**
@@ -62,7 +63,7 @@ export async function notify(input: NotifyInput): Promise<void> {
     organization_id: input.organizationId,
     type: input.type,
     title: input.title,
-    message: input.message ?? null,
+    message: nullable(input.message),
     data: input.data ?? {},
   })
   if (error) throw error
@@ -105,20 +106,41 @@ export function useActivity(limit = 30) {
   })
 }
 
-export function useNotifications(userId: string | undefined, limit = 30) {
+/**
+ * The notification inbox, one page at a time.
+ *
+ * `limit: 0` returns everything and is what the bell's unread badge uses, since a
+ * count must reflect the whole list rather than the current page.
+ */
+export function useNotifications(
+  userId: string | undefined,
+  options: { limit?: number; page?: number } = {},
+) {
+  const limit = options.limit ?? 30
+  const page = options.page ?? 1
+  const windowed = limit > 0
+  const from = (page - 1) * limit
+
   return useQuery({
-    queryKey: [...keys.notifications(userId ?? 'anonymous'), limit],
+    queryKey: [...keys.notifications(userId ?? 'anonymous'), { limit, page }],
     enabled: Boolean(userId),
     staleTime: 15_000,
-    queryFn: async (): Promise<ActivityNotification[]> => {
-      const { data, error } = await db()
+    queryFn: async (): Promise<{ rows: ActivityNotification[]; total: number }> => {
+      let query = db()
         .from('notifications')
-        .select('*')
+        .select('*', { count: 'exact' })
         .eq('user_id', userId as string)
         .order('created_at', { ascending: false })
-        .limit(limit)
+
+      if (windowed) {
+        query = limit === 1 ? query.limit(1, { count: 'exact' }) : query.range(from, from + limit - 1)
+      }
+
+      const { data, error, count } = await query
       if (error) throw error
-      return (data ?? []) as unknown as ActivityNotification[]
+
+      const rows = (data ?? []) as unknown as ActivityNotification[]
+      return { rows, total: windowed ? (count ?? rows.length) : rows.length }
     },
   })
 }

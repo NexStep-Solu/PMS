@@ -21,35 +21,76 @@ export interface WorkspaceMember {
   profiles: { id: string; full_name: string | null; avatar_url: string | null; timezone: string } | null
 }
 
-export function useMembers() {
+export function useMembers(options?: { page?: number; pageSize?: number }) {
   const { organizationId } = useWorkspace()
+  const page = options?.page ?? 1
+  const pageSize = options?.pageSize ?? 0
+  const from = (page - 1) * pageSize
+  const to = from + pageSize - 1
+  const windowed = pageSize > 0
 
   return useQuery({
-    queryKey: keys.members(organizationId ?? ''),
+    queryKey: [...keys.members(organizationId ?? ''), { page, pageSize }],
     enabled: Boolean(organizationId),
-    queryFn: async (): Promise<WorkspaceMember[]> => {
-      const { data, error } = await db()
+    queryFn: async (): Promise<{ rows: WorkspaceMember[]; total: number }> => {
+      let query = db()
         .from('organization_members')
-        .select('*, profiles!organization_members_user_id_fkey(id, full_name, avatar_url, timezone)')
+        .select('*, profiles!organization_members_user_id_fkey(id, full_name, avatar_url, timezone)', {
+          count: 'exact',
+        })
         .eq('organization_id', organizationId as string)
         .order('joined_at')
+
+      if (windowed) query = query.range(from, to)
+
+      const { data, error, count } = await query
       if (error) throw error
-      return (data ?? []) as unknown as WorkspaceMember[]
+
+      return {
+        rows: (data ?? []) as unknown as WorkspaceMember[],
+        total: windowed ? (count ?? (data ?? []).length) : (data ?? []).length,
+      }
     },
   })
 }
 
-/** Flat option list for every assignee picker. */
+/**
+ * Flat option list for every assignee picker.
+ *
+ * Pickers are *not* paginated — an assignee you cannot see is an assignee you
+ * cannot assign — so this deliberately reads the whole roster behind a generous
+ * cap rather than a page.
+ */
 export function useMemberOptions(): MemberOption[] {
-  const { data } = useMembers()
-  return (
-    data?.map((member) => ({
-      id: member.user_id,
-      full_name: member.profiles?.full_name ?? null,
-      avatar_url: member.profiles?.avatar_url ?? null,
-      role: member.role,
-    })) ?? []
-  )
+  const { organizationId } = useWorkspace()
+
+  const { data } = useQuery({
+    queryKey: [...keys.members(organizationId ?? ''), 'options'],
+    enabled: Boolean(organizationId),
+    staleTime: 300_000,
+    queryFn: async (): Promise<MemberOption[]> => {
+      const { data, error } = await db()
+        .from('organization_members')
+        .select('user_id, role, profiles!organization_members_user_id_fkey(id, full_name, avatar_url)')
+        .eq('organization_id', organizationId as string)
+        .order('joined_at')
+        .limit(500)
+      if (error) throw error
+
+      return ((data ?? []) as unknown as Array<{
+        user_id: string
+        role: Role
+        profiles: { id: string; full_name: string | null; avatar_url: string | null } | null
+      }>).map((member) => ({
+        id: member.user_id,
+        full_name: member.profiles?.full_name ?? null,
+        avatar_url: member.profiles?.avatar_url ?? null,
+        role: member.role,
+      }))
+    },
+  })
+
+  return data ?? []
 }
 
 export function useTeams() {
@@ -156,20 +197,101 @@ export function useInviteMember() {
       const invitedBy = session.data?.user.id
       if (!invitedBy) throw new Error('You must be signed in to invite members.')
 
+      const normalised = email.trim().toLowerCase()
+
+      // Re-inviting someone who already has a live link would orphan the first
+      // one, so refresh the existing invitation instead of stacking duplicates.
+      const existing = await db()
+        .from('organization_invitations')
+        .select('id, token')
+        .eq('organization_id', organizationId as string)
+        .eq('email', normalised)
+        .eq('status', 'pending')
+        .limit(1)
+        .maybeSingle()
+
+      if (existing.data) {
+        const { error } = await db()
+          .from('organization_invitations')
+          .update({ role, token: crypto.randomUUID() })
+          .eq('id', existing.data.id)
+        if (error) throw error
+        return { email: normalised, token: String(existing.data.token ?? '') }
+      }
+
+      const token = crypto.randomUUID()
       const { error } = await db().from('organization_invitations').insert({
         organization_id: organizationId as string,
-        email: email.trim().toLowerCase(),
+        email: normalised,
         role,
         invited_by: invitedBy,
         status: 'pending',
-        token: crypto.randomUUID(),
+        token,
       })
       if (error) throw error
+      return { email: normalised, token }
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
       void client.invalidateQueries({ queryKey: keys.invitations(organizationId ?? '') })
-      toast.success('Invitation sent', {
-        description: 'Share the invite link from the members page.',
+      toast.success('Invitation ready', {
+        description: `Copy the invite link and send it to ${result.email}.`,
+      })
+    },
+  })
+}
+
+/** The absolute link an admin copies and sends to the person they invited. */
+export function inviteLink(token: string): string {
+  return `${window.location.origin}/invite/${token}`
+}
+
+export interface InvitationPreview {
+  organization_name: string
+  invited_email: string
+  role: Role
+  invited_by: string
+  is_valid: boolean
+  status: 'pending' | 'accepted' | 'revoked' | 'expired'
+}
+
+/**
+ * Looks up an invite token. Runs before sign-in, so it must work for a signed
+ * out visitor; `invitation_preview` is granted to anon for exactly that.
+ */
+export function useInvitationPreview(token: string | undefined) {
+  return useQuery({
+    queryKey: keys.invitationPreview(token ?? 'none'),
+    enabled: Boolean(token),
+    retry: false,
+    queryFn: async (): Promise<InvitationPreview | null> => {
+      const { data, error } = await db().rpc<InvitationPreview>('invitation_preview', {
+        p_token: token,
+      })
+      if (error) throw error
+      return data
+    },
+  })
+}
+
+export function useAcceptInvitation() {
+  const client = useQueryClient()
+
+  return useMutation({
+    mutationFn: async (token: string) => {
+      const { data, error } = await db().rpc<{
+        organization_id: string
+        organization_name: string
+        role: Role
+      }>('accept_invitation', { p_token: token })
+      if (error) throw error
+      if (!data) throw new Error('This invitation is no longer valid.')
+      return data
+    },
+    onSuccess: (result) => {
+      // Membership, workspace list and role all just changed.
+      void client.invalidateQueries()
+      toast.success(`You joined ${result.organization_name}`, {
+        description: 'Switch to it from the workspace menu.',
       })
     },
   })

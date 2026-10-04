@@ -3,7 +3,9 @@ import { formatDistanceToNowStrict } from 'date-fns'
 import { BellOff, CheckCheck } from 'lucide-react'
 
 import { PageHeader } from '@/components/shared/page-header'
-import { EmptyState, SkeletonList } from '@/components/shared/states'
+import { EmptyState, ErrorState, SkeletonList } from '@/components/shared/states'
+import { PaginationBar } from '@/components/shared/pagination-bar'
+import { usePagination } from '@/hooks/use-pagination'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { useCurrentUser } from '@/features/auth/queries'
@@ -17,12 +19,22 @@ import {
 export function InboxPage() {
   const user = useCurrentUser()
   const navigate = useNavigate()
-  const { data, isPending } = useNotifications(user?.id, 60)
+  const pager = usePagination(25)
+  const { data, isPending, isError, refetch } = useNotifications(user?.id, {
+    limit: pager.pageSize,
+    page: pager.page,
+  })
   const markRead = useMarkNotificationRead()
   const markAll = useMarkAllNotificationsRead(user?.id)
 
-  const items = data ?? []
-  const unread = items.filter((item) => !item.read_at)
+  const items = data?.rows ?? []
+  const totalItems = data?.total ?? 0
+  // The unread tally has to cover every page, so it comes from its own count.
+  const { data: unreadCount } = useNotifications(user?.id, { limit: 1 })
+  const unread =
+    unreadCount === null || unreadCount === undefined
+      ? 0
+      : unreadCount.total - unreadCount.rows.filter((item) => !item.read_at).length
 
   const open = (item: ActivityNotification) => {
     if (!item.read_at) markRead.mutate({ id: item.id, read: true })
@@ -38,12 +50,10 @@ export function InboxPage() {
       <PageHeader
         title="Notifications"
         description={
-          unread.length > 0
-            ? `${unread.length} unread notification${unread.length === 1 ? '' : 's'}.`
-            : 'You are all caught up.'
+          unread > 0 ? `${unread} unread notification${unread === 1 ? '' : 's'}.` : 'You are all caught up.'
         }
         actions={
-          unread.length > 0 ? (
+          unread > 0 ? (
             <Button variant="outline" size="sm" onClick={() => markAll.mutate()} loading={markAll.isPending}>
               <CheckCheck aria-hidden />
               Mark all read
@@ -54,6 +64,8 @@ export function InboxPage() {
 
       {isPending ? (
         <SkeletonList rows={6} />
+      ) : isError ? (
+        <ErrorState title="Couldn't load notifications" onRetry={() => void refetch()} />
       ) : items.length === 0 ? (
         <EmptyState
           icon={<BellOff className="size-5" aria-hidden />}
@@ -61,6 +73,7 @@ export function InboxPage() {
           description="Assignments, mentions and due date reminders will appear here."
         />
       ) : (
+        <>
         <ul className="divide-y rounded-xl border">
           {items.map((item) => (
             <li key={item.id}>
@@ -88,6 +101,16 @@ export function InboxPage() {
             </li>
           ))}
         </ul>
+        <PaginationBar
+          total={totalItems}
+          rowCount={items.length}
+          page={pager.page}
+          pageSize={pager.pageSize}
+          onPageChange={pager.setPage}
+          onPageSizeChange={pager.setPageSize}
+          label="notifications"
+        />
+        </>
       )}
     </div>
   )

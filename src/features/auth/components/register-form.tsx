@@ -43,6 +43,14 @@ export function RegisterForm() {
     },
   })
 
+  /**
+   * An invite link carries `?token=`. The token goes into signup metadata so
+   * `handle_new_user` joins the existing workspace instead of minting a second,
+   * empty one for the new user.
+   */
+  const inviteToken = params.get('token') ?? undefined
+  const joining = Boolean(inviteToken)
+
   const onSubmit = form.handleSubmit(async (values) => {
     const { data, error } = await db().auth.signUp({
       email: values.email,
@@ -50,7 +58,9 @@ export function RegisterForm() {
       options: {
         data: {
           full_name: values.fullName,
+          // Ignored when an invite token is present; the SQL branches on the token.
           organization_name: values.workspaceName || `${values.fullName}'s workspace`,
+          ...(inviteToken ? { invite_token: inviteToken } : {}),
         },
         emailRedirectTo: `${window.location.origin}/app/dashboard`,
       },
@@ -66,7 +76,9 @@ export function RegisterForm() {
     if (!data.session) {
       setAwaitingConfirmation(values.email)
       toast.success('Confirm your email', {
-        description: 'We sent you a link. Click it to finish setting up your workspace.',
+        description: joining
+          ? 'We sent you a link. Click it to finish joining the workspace.'
+          : 'We sent you a link. Click it to finish setting up your workspace.',
       })
       return
     }
@@ -125,15 +137,19 @@ export function RegisterForm() {
           </FormItem>
         </FormField>
 
-        <FormField name="workspaceName">
-          <FormItem>
-            <FormLabel>Workspace name</FormLabel>
-            <FormControl>
-              {(props) => <Input {...props} placeholder="Acme Product Team" className="h-10" />}
-            </FormControl>
-            <FormMessage />
-          </FormItem>
-        </FormField>
+        {/* Asking for a workspace name during a join would be noise: the token
+            already decides which workspace they land in. */}
+        {joining ? null : (
+          <FormField name="workspaceName">
+            <FormItem>
+              <FormLabel>Workspace name</FormLabel>
+              <FormControl>
+                {(props) => <Input {...props} placeholder="Acme Product Team" className="h-10" />}
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          </FormField>
+        )}
 
         <div className="grid gap-4 sm:grid-cols-2">
           <FormField name="password">

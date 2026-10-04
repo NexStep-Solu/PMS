@@ -38,7 +38,13 @@ function MemberItem({
         className,
       )}
     >
-      {children}
+      {/* ItemText is the only part Radix copies into the closed trigger. Radix
+          re-wraps its children in a bare inline <span> and drops any className
+          set here, so the row layout has to live on a child element it keeps.
+          The check mark stays outside ItemText so it is not duplicated. */}
+      <SelectPrimitive.ItemText>
+        <span className="inline-flex min-w-0 max-w-full items-center gap-2">{children}</span>
+      </SelectPrimitive.ItemText>
       <span className="absolute right-2 flex size-3.5 items-center justify-center">
         <SelectPrimitive.ItemIndicator>
           <Check className="size-4" />
@@ -75,8 +81,8 @@ export function MemberSelect({
 
   return (
     <Select
-      value={value ?? NONE}
-      onValueChange={(next) => onChange(next === NONE ? null : next)}
+      value={value || NONE}
+      onValueChange={(next) => onChange(next && next !== NONE ? next : null)}
       disabled={disabled || isEmpty}
     >
       <SelectTrigger id={id} className={className} size="sm" aria-label={ariaLabel}>
@@ -91,7 +97,7 @@ export function MemberSelect({
             {members.map((member) => (
               <MemberItem key={member.id} value={member.id}>
                 <UserAvatar person={member} size={18} />
-                <span className="truncate">{member.full_name ?? 'Unknown'}</span>
+                <span className="min-w-0 truncate">{member.full_name ?? 'Unknown'}</span>
               </MemberItem>
             ))}
           </SelectGroup>

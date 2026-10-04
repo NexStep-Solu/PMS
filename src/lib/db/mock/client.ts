@@ -18,6 +18,8 @@ import type {
   ListResponse,
   RealtimeApi,
   RealtimeChannel,
+  RpcApi,
+  RpcResult,
   SelectBuilder,
   SingleResponse,
   StorageApi,
@@ -279,7 +281,10 @@ class DemoContext {
     if (orgIds.length === 0) return [{ op: 'eq', column: 'id', value: '__no_access__' }]
 
     if (USER_SCOPED.has(table)) {
-      if (table === 'organization_members') return [{ op: 'eq', column: 'user_id', value: this.currentUserId }]
+      // The roster is org-scoped, not self-scoped: members must be able to see
+      // every teammate, or the assignee pickers and the members page show only
+      // the signed-in user. Mirrors the org_members_select policy.
+      if (table === 'organization_members') return [{ op: 'in', column: 'organization_id', value: orgIds }]
       if (table === 'organizations') return [{ op: 'in', column: 'id', value: orgIds }]
       return []
     }
@@ -375,6 +380,231 @@ class DemoContext {
 
   /* ---------------------------------------------------------- auth */
 
+  /* ---------------------------------------------------------------- */
+  /* Workspaces                                                        */
+  /* ---------------------------------------------------------------- */
+
+  private createPersonalWorkspace(userId: string, email: string): string {
+    const orgId = `org-${userId}`
+    const label = email.split('@')[0] ?? 'workspace'
+    this.store.table('organizations').push({
+      id: orgId,
+      name: `${label}'s workspace`,
+      slug: `${label}-${userId}`.toLowerCase().replace(/[^a-z0-9-]/g, '-'),
+      logo_url: null,
+      created_by: userId,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    this.store.table('organization_members').push({
+      id: `om-${userId}`,
+      organization_id: orgId,
+      user_id: userId,
+      role: 'owner',
+      joined_at: new Date().toISOString(),
+    })
+    return orgId
+  }
+
+  /** Returns false when the token is dead or addressed to someone else. */
+  private joinByToken(token: string, userId: string, email: string): boolean {
+    const invite = this.store
+      .rows('organization_invitations', (row) => row.token === token)
+      .find(
+        (row) => row.status === 'pending' && new Date(row.expires_at as string).getTime() > Date.now(),
+      )
+    if (!invite) return false
+    if ((invite.email as string).toLowerCase() !== email) return false
+
+    this.store.table('organization_members').push({
+      id: `om-${userId}-${invite.organization_id}`,
+      organization_id: invite.organization_id,
+      user_id: userId,
+      role: invite.role,
+      joined_at: new Date().toISOString(),
+    })
+    invite.status = 'accepted'
+    invite.accepted_at = new Date().toISOString()
+    return true
+  }
+
+  /**
+   * Mirrors `public.workspace_report`: one row per task shape rather than one row
+   * per task, so the reports page never has to hold the whole task table.
+   */
+  private workspaceReport<T>(orgId: string): RpcResult<T> {
+    const statuses = new Map(
+      this.store.rows('task_statuses', () => true).map((row) => [row.id as string, row]),
+    )
+    const projects = new Map(
+      this.store.rows('projects', () => true).map((row) => [row.id as string, row]),
+    )
+
+    const buckets = new Map<
+      string,
+      {
+        project_id: string | null
+        project_key: string | null
+        status_id: string
+        priority_id: string | null
+        assignee_id: string | null
+        total: number
+        done: number
+        in_progress: number
+        overdue: number
+      }
+    >()
+
+    const today = new Date().toISOString().slice(0, 10)
+
+    for (const task of this.store.rows('tasks', (row) => row.organization_id === orgId)) {
+      const status = statuses.get(task.status_id as string)
+      // Mirror the SQL's inner join: a task with no matching status is not counted.
+      if (!status) continue
+
+      const isDone = status.is_completed === true && status.category !== 'cancelled'
+      const isCancelled = status.category === 'cancelled'
+      const key = [
+        task.project_id ?? 'none',
+        task.status_id,
+        task.priority_id ?? 'none',
+        task.assignee_id ?? 'none',
+      ].join('|')
+
+      const bucket = buckets.get(key) ?? {
+        project_id: (task.project_id as string | null) ?? null,
+        project_key:
+          task.project_id === null ? null : ((projects.get(task.project_id as string)?.key as string) ?? null),
+        status_id: task.status_id as string,
+        priority_id: (task.priority_id as string | null) ?? null,
+        assignee_id: (task.assignee_id as string | null) ?? null,
+        total: 0,
+        done: 0,
+        in_progress: 0,
+        overdue: 0,
+      }
+
+      bucket.total += 1
+      if (isDone) bucket.done += 1
+      if (status.category === 'in_progress') bucket.in_progress += 1
+      const due = (task.due_date as string | null) ?? null
+      if (due !== null && due < today && !isDone && !isCancelled) bucket.overdue += 1
+
+      buckets.set(key, bucket)
+    }
+
+    return { data: [...buckets.values()] as T, error: null }
+  }
+
+  private workspaceTimeTotal<T>(orgId: string): RpcResult<T> {
+    let trackedMinutes = 0
+    let runningEntries = 0
+    let loggedEntries = 0
+
+    for (const entry of this.store.rows('time_entries', (row) => row.organization_id === orgId)) {
+      if (entry.is_running) {
+        runningEntries += 1
+      } else {
+        trackedMinutes += Number(entry.duration_minutes ?? 0)
+        loggedEntries += 1
+      }
+    }
+
+    return {
+      data: {
+        tracked_minutes: trackedMinutes,
+        running_entries: runningEntries,
+        logged_entries: loggedEntries,
+      } as T,
+      error: null,
+    }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Postgres functions                                                */
+  /* ---------------------------------------------------------------- */
+
+  async rpc<T>(fn: string, args: Record<string, unknown> = {}): Promise<RpcResult<T>> {
+    switch (fn) {
+      case 'invitation_preview':
+        return this.invitationPreview<T>(args.p_token as string)
+      case 'accept_invitation':
+        return this.acceptInvitation<T>(args.p_token as string)
+      case 'workspace_report':
+        return this.workspaceReport<T>(args.p_org as string)
+      case 'workspace_time_total':
+        return this.workspaceTimeTotal<T>(args.p_org as string)
+      default:
+        return {
+          data: null as T,
+          error: new AppError('not_found', `Unknown function "${fn}".`, { code: '42883' }),
+        }
+    }
+  }
+
+  private invitationPreview<T>(token: string): RpcResult<T> {
+    const invite = this.store.rows('organization_invitations', (row) => row.token === token)[0]
+    if (!invite) return { data: null as T, error: null }
+
+    const org = this.store
+      .rows('organizations', (row) => row.id === invite.organization_id)[0]
+    const inviter = this.store.rows('profiles', (row) => row.id === invite.invited_by)[0]
+
+    return {
+      data: {
+        organization_name: org?.name ?? 'this workspace',
+        invited_email: invite.email,
+        role: invite.role,
+        invited_by: inviter?.full_name ?? 'A teammate',
+        is_valid: invite.status === 'pending' && new Date(invite.expires_at as string).getTime() > Date.now(),
+        status: invite.status,
+      } as T,
+      error: null,
+    }
+  }
+
+  private acceptInvitation<T>(token: string): RpcResult<T> {
+    const email = (this.session?.user.email ?? '').toLowerCase()
+    const invite = this.store
+      .rows('organization_invitations', (row) => row.token === token)
+      .find(
+        (row) => row.status === 'pending' && new Date(row.expires_at as string).getTime() > Date.now(),
+      )
+
+    if (!token) {
+      return { data: null as T, error: new AppError('not_found', 'Invitation not found.') }
+    }
+    if (!invite) {
+      return {
+        data: null as T,
+        error: new AppError('not_found', 'This invitation is no longer valid.', { code: 'no_data_found' }),
+      }
+    }
+    if ((invite.email as string).toLowerCase() !== email) {
+      return {
+        data: null as T,
+        error: new AppError(
+          'validation',
+          `This invitation was sent to ${invite.email}.`,
+          { code: 'insufficient_privilege' },
+        ),
+      }
+    }
+
+    const userId = this.session!.user.id
+    this.joinByToken(token, userId, email)
+    const org = this.store.rows('organizations', (row) => row.id === invite.organization_id)[0]
+
+    return {
+      data: {
+        organization_id: invite.organization_id,
+        organization_name: org?.name ?? 'this workspace',
+        role: invite.role,
+      } as T,
+      error: null,
+    }
+  }
+
   signIn(
     email: string,
     password: string,
@@ -395,7 +625,10 @@ class DemoContext {
     return { data: { user, session }, error: null }
   }
 
-  signUp(email: string): AuthStateResult<{ user: AuthUser | null; session: AuthSession | null }> {
+  signUp(
+    email: string,
+    inviteToken?: string,
+  ): AuthStateResult<{ user: AuthUser | null; session: AuthSession | null }> {
     const normalised = email.trim().toLowerCase()
     if (DEMO_USERS.some((user) => user.email === normalised)) {
       return {
@@ -418,6 +651,13 @@ class DemoContext {
     const session = this.makeSession(user)
     this.session = session
     this.persistSession(user.id)
+
+    // Same order of preference as handle_new_user: an invited signup joins the
+    // existing workspace, otherwise it gets a personal one. Without this a demo
+    // signup would land with no workspace at all.
+    const joined = inviteToken ? this.joinByToken(inviteToken, id, normalised) : false
+    if (!joined) this.createPersonalWorkspace(id, normalised)
+
     this.emit('SIGNED_IN', session)
     return { data: { user, session }, error: null }
   }
@@ -503,7 +743,10 @@ export function createDemoClient(): DatabaseClient {
   const context = new DemoContext()
 
   const auth: AuthApi = {
-    signUp: (params) => Promise.resolve(context.signUp(params.email)),
+    signUp: (params) =>
+      Promise.resolve(
+        context.signUp(params.email, params.options?.data?.invite_token as string | undefined),
+      ),
     signInWithPassword: (params) => Promise.resolve(context.signIn(params.email, params.password)),
     signOut: () => Promise.resolve(context.signOut()),
     getUser: () => Promise.resolve(context.getUser()),
@@ -599,5 +842,7 @@ export function createDemoClient(): DatabaseClient {
     return ref as unknown as TableRef<DatabaseSchema[K]>
   }
 
-  return { from, auth, storage, realtime }
+  const rpc: RpcApi = (fn, args) => context.rpc(fn, args ?? {})
+
+  return { from, rpc, auth, storage, realtime }
 }

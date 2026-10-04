@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ColumnDef } from '@tanstack/react-table'
 import { Plus, SlidersHorizontal } from 'lucide-react'
 
@@ -6,6 +6,8 @@ import { DataTable } from '@/components/data-table/data-table'
 import { LabelBadge, PriorityBadge, StatusBadge } from '@/components/shared/badges'
 import { UserAvatar } from '@/components/shared/user-avatar'
 import { EmptyState } from '@/components/shared/states'
+import { PaginationBar } from '@/components/shared/pagination-bar'
+import { usePagination } from '@/hooks/use-pagination'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -40,11 +42,18 @@ export function TaskListView({
   statuses,
   projectNames,
   canUpdate,
+  projectId,
 }: {
   tasks: TaskWithMeta[]
   statuses: TaskStatus[]
   projectNames: Record<string, string>
   canUpdate: boolean
+  /**
+   * The project this list belongs to. Passing it keeps "New task" scoped here;
+   * without it the dialog falls back to the first project in the workspace and
+   * the task silently lands somewhere else.
+   */
+  projectId?: string
 }) {
   const { openTask, openCreate } = useTaskDialog()
   const members = useMemberOptions()
@@ -53,6 +62,18 @@ export function TaskListView({
   const [statusIds, setStatusIds] = useState<string[]>([])
   const [assigneeIds, setAssigneeIds] = useState<string[]>([])
   const [overdueOnly, setOverdueOnly] = useState(false)
+  const pager = usePagination(25)
+
+  // Any filter change invalidates the current page number, otherwise page 4 of an
+  // old result set shows an empty table.
+  const filterKey = `${term}|${statusIds.join(',')}|${assigneeIds.join(',')}|${overdueOnly}`
+  const lastFilterKey = useRef(filterKey)
+  useEffect(() => {
+    if (lastFilterKey.current !== filterKey) {
+      lastFilterKey.current = filterKey
+      pager.reset()
+    }
+  }, [filterKey, pager])
 
   const filtered = useMemo(() => {
     const needle = term.trim().toLowerCase()
@@ -115,10 +136,12 @@ export function TaskListView({
       },
       {
         id: 'project',
-        accessorFn: (task) => projectNames[task.project_id] ?? '',
+        accessorFn: (task) => projectNames[task.project_id] ?? task.project?.name ?? '',
         header: 'Project',
         cell: ({ row }) => (
-          <span className="text-muted-foreground">{projectNames[row.original.project_id] ?? '—'}</span>
+          <span className="text-muted-foreground">
+            {projectNames[row.original.project_id] ?? row.original.project?.name ?? '—'}
+          </span>
         ),
       },
       {
@@ -257,7 +280,7 @@ export function TaskListView({
         </span>
 
         {canUpdate ? (
-          <Button size="sm" className="ml-auto" onClick={() => openCreate()}>
+          <Button size="sm" className="ml-auto" onClick={() => openCreate({ projectId })}>
             <Plus aria-hidden />
             New task
           </Button>
@@ -270,7 +293,7 @@ export function TaskListView({
           description="Create the first task for this project and it will appear here."
           action={
             canUpdate ? (
-              <Button size="sm" onClick={() => openCreate()}>
+              <Button size="sm" onClick={() => openCreate({ projectId })}>
                 <Plus aria-hidden />
                 New task
               </Button>
@@ -278,14 +301,26 @@ export function TaskListView({
           }
         />
       ) : (
+        <>
         <DataTable
-          data={filtered}
+          data={filtered.slice(pager.from, pager.to + 1)}
           columns={columns}
           togglableColumns={TOGGLEABLE}
           rowKey={(task) => task.id}
           onRowClick={(task) => openTask(task.id)}
           emptyMessage="No tasks match these filters."
         />
+        <PaginationBar
+          total={filtered.length}
+          rowCount={Math.min(pager.pageSize, Math.max(0, filtered.length - pager.from))}
+          page={pager.page}
+          pageSize={pager.pageSize}
+          onPageChange={pager.setPage}
+          onPageSizeChange={pager.setPageSize}
+          label="tasks"
+          className="mt-3"
+        />
+        </>
       )}
     </div>
   )

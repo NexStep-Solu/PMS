@@ -152,6 +152,11 @@ function TopbarBreadcrumbs() {
   const { openCreate } = useTaskDialog()
   const { can } = usePermission()
 
+  // On a project route the quick-create button must stay inside that project,
+  // otherwise the dialog falls back to the first project in the workspace and
+  // the task lands somewhere the user is not looking.
+  const routeProjectId = location.pathname.match(/^\/app\/projects\/([^/]+)/)?.[1]
+
   return (
     <div className="flex min-w-0 flex-1 items-center gap-3">
       <div className="min-w-0 flex-1 overflow-hidden">
@@ -165,7 +170,11 @@ function TopbarBreadcrumbs() {
       </div>
 
       {can('tasks.create') ? (
-        <Button size="sm" className="hidden sm:inline-flex" onClick={() => openCreate()}>
+        <Button
+          size="sm"
+          className="hidden sm:inline-flex"
+          onClick={() => openCreate(routeProjectId ? { projectId: routeProjectId } : undefined)}
+        >
           <Plus aria-hidden />
           New task
         </Button>

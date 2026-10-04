@@ -64,10 +64,16 @@ export interface QueryOutcome {
 /* SQL LIKE                                                            */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Both wildcards are accepted because PostgREST uses `*` inside an `or(...)`
+ * expression while a plain `like` uses SQL's `%`. The demo has to behave like the
+ * real API here, or a query that works against Supabase silently matches nothing
+ * in demo mode.
+ */
 function likeToRegExp(pattern: string, flags: 'i' | ''): RegExp {
   let out = ''
   for (const char of pattern) {
-    if (char === '%') out += '[\\s\\S]*'
+    if (char === '%' || char === '*') out += '[\\s\\S]*'
     else if (char === '_') out += '[\\s\\S]'
     else out += char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   }

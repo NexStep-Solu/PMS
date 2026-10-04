@@ -47,6 +47,8 @@ import { ACCEPTED_UPLOAD_TYPES, MAX_ATTACHMENT_BYTES } from '@/lib/constants'
 import { friendlyMessage } from '@/lib/db/errors'
 import { cn, formatBytes } from '@/lib/utils'
 import type { ActivityAction, ActivityLog } from '@/types/database'
+import { PaginationBar } from '@/components/shared/pagination-bar'
+import { usePagination } from '@/hooks/use-pagination'
 import { useCurrentUser } from '@/features/auth/queries'
 import { useActivity } from '@/features/activity/queries'
 import { useMemberOptions } from '@/features/organizations/queries'
@@ -558,18 +560,30 @@ type TaskCommentRow = { id: string; user_id: string; content: string; created_at
 
 function CommentsSection({ taskId, taskTitle }: { taskId: string; taskTitle: string }) {
   const userId = useCurrentUser()?.id
-  const { data: comments, isPending } = useComments(taskId)
+  const pager = usePagination(25)
+  const { data: comments, isPending } = useComments(taskId, {
+    page: pager.page,
+    pageSize: pager.pageSize,
+  })
   const addComment = useAddComment(taskId)
   const deleteComment = useDeleteComment(taskId)
   const [content, setContent] = useState('')
 
-  const list = (comments ?? []) as unknown as CommentWithAuthor[]
+  const list = (comments?.rows ?? []) as unknown as CommentWithAuthor[]
+  const totalComments = comments?.total ?? 0
 
   const submit = () => {
     if (!content.trim() || !userId) return
     addComment.mutate(
       { content: content.trim(), userId, taskTitle },
-      { onSuccess: () => setContent('') },
+      {
+        onSuccess: () => {
+          setContent('')
+          // Comments load oldest-first, so a new one lands on the final page.
+          const lastPage = Math.max(1, Math.ceil((totalComments + 1) / pager.pageSize))
+          if (lastPage !== pager.page) pager.setPage(lastPage)
+        },
+      },
     )
   }
 
@@ -578,7 +592,9 @@ function CommentsSection({ taskId, taskTitle }: { taskId: string; taskTitle: str
       <div className="flex items-center gap-2">
         <MessageSquare className="size-3.5 text-muted-foreground" aria-hidden />
         <h3 className="text-[13px] font-semibold tracking-wide text-muted-foreground uppercase">Comments</h3>
-        {list.length > 0 ? <span className="text-xs text-muted-foreground">{list.length}</span> : null}
+        {totalComments > 0 ? (
+          <span className="text-xs text-muted-foreground tabular">{totalComments}</span>
+        ) : null}
       </div>
 
       {isPending ? (
@@ -625,6 +641,17 @@ function CommentsSection({ taskId, taskTitle }: { taskId: string; taskTitle: str
           ))}
         </ul>
       )}
+
+      <PaginationBar
+        total={totalComments}
+        rowCount={list.length}
+        page={pager.page}
+        pageSize={pager.pageSize}
+        onPageChange={pager.setPage}
+        onPageSizeChange={pager.setPageSize}
+        label="comments"
+        className="pt-1"
+      />
 
       <form
         className="flex items-start gap-2"
@@ -679,7 +706,9 @@ function AttachmentsSection({
       <div className="flex items-center gap-2">
         <Paperclip className="size-3.5 text-muted-foreground" aria-hidden />
         <h3 className="text-[13px] font-semibold tracking-wide text-muted-foreground uppercase">Attachments</h3>
-        {list.length > 0 ? <span className="text-xs text-muted-foreground">{list.length}</span> : null}
+        {list.length > 0 ? (
+          <span className="text-xs text-muted-foreground tabular">{list.length}</span>
+        ) : null}
       </div>
 
       {list.length === 0 ? (

@@ -25,7 +25,8 @@ export function DashboardPage() {
   const { organizationName, organizationId, can } = useWorkspace()
   const { openTask, openCreate } = useTaskDialog()
   const { data: tasks, isPending, isError, refetch } = useTasksByOrganization(organizationId ?? undefined)
-  const { data: projects } = useProjects()
+  const { data: projectPage } = useProjects()
+  const projects = projectPage?.rows
   const { data: activity } = useActivity(10)
   const { data: milestones } = useOrgMilestones(organizationId ?? undefined)
 

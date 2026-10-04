@@ -5,6 +5,15 @@
  * human readable message. See `src/lib/db/errors.ts` for the translation.
  */
 
+/**
+ * Where an error came from.
+ *
+ * `database` errors carry Postgres text ("invalid input syntax for type uuid")
+ * that must never reach a user — it goes to the console instead, and the UI
+ * shows the generic message for that kind.
+ */
+export type AppErrorSource = 'app' | 'auth' | 'database'
+
 export type AppErrorKind =
   | 'network'
   | 'unauthorized'
@@ -21,11 +30,24 @@ export class AppError extends Error {
   readonly code: string | null
   readonly details: string | null
   readonly hint: string | null
+  readonly source: AppErrorSource
+  /**
+   * A curated, human-readable explanation. Lets the database layer say
+   * "that value had the wrong format" without leaking the SQL text, which
+   * stays on `message` for the console.
+   */
+  readonly userMessage: string | null
 
   constructor(
     kind: AppErrorKind,
     message: string,
-    options: { code?: string | null; details?: string | null; hint?: string | null } = {},
+    options: {
+      code?: string | null
+      details?: string | null
+      hint?: string | null
+      source?: AppErrorSource
+      userMessage?: string | null
+    } = {},
   ) {
     super(message)
     this.name = 'AppError'
@@ -33,6 +55,8 @@ export class AppError extends Error {
     this.code = options.code ?? null
     this.details = options.details ?? null
     this.hint = options.hint ?? null
+    this.source = options.source ?? 'app'
+    this.userMessage = options.userMessage ?? null
   }
 
   toJSON() {
@@ -42,6 +66,8 @@ export class AppError extends Error {
       code: this.code,
       details: this.details,
       hint: this.hint,
+      source: this.source,
+      userMessage: this.userMessage,
     }
   }
 }
@@ -83,10 +109,23 @@ export function kindFromCode(code: string | null | undefined): AppErrorKind {
 }
 
 export function friendlyMessage(error: AppError): string {
+  // A curated explanation always wins: it was written for humans.
+  if (error.userMessage) return error.userMessage
+
+  // Raw database text never reaches a user.
+  if (error.source === 'database') return FRIENDLY[error.kind]
+
   if (error.kind === 'validation' || error.kind === 'conflict' || error.kind === 'upload') {
     return error.message
   }
   return FRIENDLY[error.kind]
+}
+
+/** `invalid_text_representation` and friends: the caller sent a bad shape. */
+const SHAPE_HINTS: Record<string, string> = {
+  '22P02': 'One of the values sent was not the right format. Reload the page and try again.',
+  '22007': 'One of the values sent is out of range.',
+  '22008': 'The date sent was not valid.',
 }
 
 const NETWORK_PATTERN =
@@ -124,7 +163,17 @@ export function toAppError(input: unknown, fallback: AppErrorKind = 'unknown'): 
   }
 
   if (message) {
-    return new AppError(kindFromCode(code), message, { code, details, hint })
+    const kind = kindFromCode(code)
+    if (code && SHAPE_HINTS[code]) {
+      return new AppError('validation', message, {
+        code,
+        details,
+        hint,
+        source: 'database',
+        userMessage: SHAPE_HINTS[code],
+      })
+    }
+    return new AppError(kind, message, { code, details, hint })
   }
 
   return new AppError(fallback, FRIENDLY[fallback])

@@ -72,6 +72,7 @@ export function ProjectListView() {
       statuses={statuses}
       projectNames={{ [projectId ?? '']: 'This project' }}
       canUpdate={can('tasks.update')}
+      projectId={projectId}
     />
   )
 }
@@ -92,6 +93,7 @@ export function ProjectCalendarView() {
     <TaskCalendarView
       tasks={tasks ?? []}
       statuses={statuses}
+      projectId={projectId}
       milestones={(milestones ?? []).map((milestone) => ({
         id: milestone.id,
         name: milestone.name,

@@ -58,3 +58,23 @@ export function sum(values: number[]): number {
 export function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max)
 }
+
+/**
+ * Normalise a form value for a nullable column.
+ *
+ * `??` is not enough here: `''` is neither null nor undefined, so
+ * `value ?? null` happily sends an empty string to Postgres and you get
+ * `invalid input syntax for type uuid: ""`. Selects and date pickers produce
+ * empty strings far more often than you would expect.
+ */
+export function nullable<T>(value: T | null | undefined | ''): T | null {
+  if (value === null || value === undefined) return null
+  if (typeof value === 'string' && (value as string).trim() === '') return null
+  return value as T
+}
+
+/** Like {@link nullable}, but `undefined` is preserved as `undefined`. */
+export function optionalNullable<T>(value: T | null | undefined | ''): T | null | undefined {
+  if (value === undefined) return undefined
+  return nullable(value)
+}

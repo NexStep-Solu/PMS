@@ -55,7 +55,11 @@ export function ProjectSelect({
                   className="relative flex cursor-default items-center gap-2 rounded-md py-1.5 pr-8 pl-2 text-sm outline-none select-none focus:bg-accent focus:text-accent-foreground"
                 >
                   <FolderKanban className="size-3.5 text-muted-foreground" aria-hidden />
-                  <span className="truncate">{project.name}</span>
+                  {/* ItemText is what Radix copies into the closed trigger.
+                      Without it the trigger renders blank. */}
+                  <SelectPrimitive.ItemText className="truncate">
+                    {project.name}
+                  </SelectPrimitive.ItemText>
                   <span className="ml-auto font-mono text-[10px] text-muted-foreground">{project.key}</span>
                   <span className="absolute right-2 flex size-3.5 items-center justify-center">
                     <SelectPrimitive.ItemIndicator>

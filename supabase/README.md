@@ -222,3 +222,42 @@ limit 20;
 `record_activity()` and `notify()` are `security definer` helpers so the client
 can write an audit row or a notification without bypassing the membership
 check.
+## Invitations
+
+Every signup needs a workspace, but an invited user must *join* the one they were
+invited to rather than get a second, empty one. Both paths resolve through the
+invitation token:
+
+1. An admin invites someone from **Members**. A row lands in
+   `organization_invitations` with a random `token`, and the members page offers a
+   copyable `/invite/<token>` link.
+2. The invitee opens the link. Signed out, the page renders from
+   `public.invitation_preview(token)`, which is granted to `anon` and returns only
+   the workspace name, their role and the inviter.
+3. They sign in or create an account. `/register?token=…` puts the token into
+   signup metadata, and `handle_new_user` calls `public.accept_invitation` instead
+   of creating a workspace. A stale or mistyped link falls back to a personal
+   workspace rather than blocking signup.
+4. An existing member accepts from the link with `public.accept_invitation(token)`.
+
+`accept_invitation` is `security definer`, because the caller is by definition not
+yet a member and so cannot satisfy the `organization_members` policies. It is
+`revoke`d from `public` and granted only to `authenticated`. Inside it checks
+that the token is `pending` and unexpired, **and** that the caller's verified
+email matches the invited address — that last check is what stops anyone holding
+a valid link from walking into a workspace they were not invited to.
+
+Invitations expire after 14 days. `verify.sql` section 10 asserts `anon` cannot
+execute the function.
+
+## Reporting
+
+The reports screen reads `public.workspace_report(org)`, which groups tasks by
+project, status, priority and assignee and returns counts. Its payload is bounded
+by the number of distinct combinations rather than the number of tasks, so it does
+not grow with the workspace the way the previous client-side aggregation did. It
+applies the same `private.can_read_task` visibility rule as `tasks_select`, so the
+numbers always match the lists.
+
+`public.workspace_time_total(org)` does the same for `time_entries`. Both are
+`security definer` with the same revoke/grant treatment as `accept_invitation`.

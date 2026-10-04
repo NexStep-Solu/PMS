@@ -4,7 +4,7 @@ import { Play, Square, Timer, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { PageHeader } from '@/components/shared/page-header'
-import { EmptyState, SkeletonList } from '@/components/shared/states'
+import { EmptyState, ErrorState, SkeletonList } from '@/components/shared/states'
 import { ProjectSelect } from '@/components/shared/task-form-fields'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -27,7 +27,7 @@ export function TimeTrackingPage() {
   const { organizationId } = useWorkspace()
   const { can } = useWorkspace()
   const { data: projects } = useProjectsSidebar()
-  const { data: entries, isPending } = useTimeEntries(organizationId ?? undefined)
+  const { data: entries, isPending, isError, refetch } = useTimeEntries(organizationId ?? undefined)
   const { data: running } = useRunningEntry()
   const startTimer = useStartTimer()
   const stopTimer = useStopTimer()
@@ -153,6 +153,8 @@ export function TimeTrackingPage() {
 
       {isPending ? (
         <SkeletonList rows={5} />
+      ) : isError ? (
+        <ErrorState title="Couldn't load your time entries" onRetry={() => void refetch()} />
       ) : (entries ?? []).length === 0 ? (
         <EmptyState
           icon={<Timer className="size-5" aria-hidden />}

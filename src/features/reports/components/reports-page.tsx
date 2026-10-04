@@ -8,10 +8,14 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { STATUS_META } from '@/lib/constants'
 import { useWorkspace } from '@/features/organizations/workspace-context'
 import { useMemberOptions } from '@/features/organizations/queries'
-import { useProjects } from '@/features/projects/queries'
-import { useTasksByOrganization, useWorkspaceTaskMeta } from '@/features/tasks/queries'
-import { useTimeEntries } from '@/features/time-tracking/queries'
-import { dueState, summariseProgress } from '@/features/tasks/utils'
+import { useWorkspaceTaskMeta } from '@/features/tasks/queries'
+import { summariseReport, useWorkspaceReport, useWorkspaceTimeTotal } from '@/features/reports/queries'
+
+/** Postgres returns bigint as a string over PostgREST. */
+const toCount = (value: number | string | null | undefined): number => {
+  const parsed = typeof value === 'string' ? Number(value) : (value ?? 0)
+  return Number.isFinite(parsed) ? parsed : 0
+}
 
 const CHART_COLORS = [
   'var(--color-status-progress)',
@@ -27,64 +31,76 @@ const CHART_COLORS = [
  * numbers so the information is available without relying on colour.
  */
 export function ReportsPage() {
-  const { organizationName, organizationId, can } = useWorkspace()
+  const { organizationName, can } = useWorkspace()
   const members = useMemberOptions()
-  const { data: tasks, isPending, isError, refetch } = useTasksByOrganization(organizationId ?? undefined)
-  const { data: projects } = useProjects()
   const { statuses, priorities } = useWorkspaceTaskMeta()
-  const { data: timeEntries } = useTimeEntries(organizationId ?? undefined)
+
+  // Charts read Postgres-side aggregates. The reports screen used to fetch every
+  // task in the workspace and fold it up in the browser.
+  const { data: rows, isPending, isError, refetch } = useWorkspaceReport()
+  const { data: timeTotal } = useWorkspaceTimeTotal()
+
+  // Stable identity keeps the chart memos from re-running every render.
+  const reportRows = useMemo(() => rows ?? [], [rows])
 
   const statusData = useMemo(() => {
     const map = new Map<string, number>()
     for (const status of statuses) map.set(status.name, 0)
-    for (const task of tasks ?? []) map.set(task.status.name, (map.get(task.status.name) ?? 0) + 1)
+    for (const row of reportRows) {
+      const name = statuses.find((status) => status.id === row.status_id)?.name
+      if (name) map.set(name, (map.get(name) ?? 0) + toCount(row.total))
+    }
     return [...map.entries()]
       .map(([name, count]) => ({ name, count }))
       .sort((a, b) => b.count - a.count)
-  }, [tasks, statuses])
+  }, [reportRows, statuses])
 
   const workloadData = useMemo(() => {
     const totals = new Map<string, number>()
-    for (const task of tasks ?? []) {
-      if (!task.assignee_id || task.status.is_completed) continue
-      totals.set(task.assignee_id, (totals.get(task.assignee_id) ?? 0) + 1)
+    for (const row of reportRows) {
+      if (!row.assignee_id) continue
+      totals.set(row.assignee_id, (totals.get(row.assignee_id) ?? 0) + toCount(row.total) - toCount(row.done))
     }
     return members
-      .map((member) => ({ name: member.full_name ?? 'Unnamed', open: totals.get(member.id) ?? 0 }))
+      .map((member) => ({
+        name: member.full_name ?? 'Unnamed',
+        open: Math.max(0, totals.get(member.id) ?? 0),
+      }))
       .sort((a, b) => b.open - a.open)
       .slice(0, 10)
-  }, [members, tasks])
+  }, [members, reportRows])
 
   const priorityData = useMemo(() => {
     const map = new Map<string, number>()
     for (const priority of priorities) map.set(priority.name, 0)
-    for (const task of tasks ?? []) {
-      if (task.priority) map.set(task.priority.name, (map.get(task.priority.name) ?? 0) + 1)
+    for (const row of reportRows) {
+      const name = priorities.find((priority) => priority.id === row.priority_id)?.name
+      if (name) map.set(name, (map.get(name) ?? 0) + toCount(row.total))
     }
     return [...map.entries()].map(([name, count]) => ({ name, count }))
-  }, [tasks, priorities])
+  }, [reportRows, priorities])
 
   const projectData = useMemo(() => {
-    return (projects ?? [])
-      .map((project) => {
-        const projectTasks = (tasks ?? []).filter((task) => task.project_id === project.id)
-        return { name: project.key, progress: summariseProgress(projectTasks).percent, total: projectTasks.length }
-      })
+    const byProject = new Map<string, { key: string; total: number; done: number }>()
+    for (const row of reportRows) {
+      const key = row.project_id ?? 'unassigned'
+      const entry = byProject.get(key) ?? { key: row.project_key ?? 'Unassigned', total: 0, done: 0 }
+      entry.total += toCount(row.total)
+      entry.done += toCount(row.done)
+      byProject.set(key, entry)
+    }
+    return [...byProject.values()]
+      .map((entry) => ({
+        name: entry.key,
+        total: entry.total,
+        progress: entry.total === 0 ? 0 : Math.round((entry.done / entry.total) * 100),
+      }))
       .sort((a, b) => b.progress - a.progress)
-  }, [projects, tasks])
+  }, [reportRows])
 
-  const trackedMinutes = useMemo(
-    () =>
-      (timeEntries ?? [])
-        .filter((entry) => !entry.is_running)
-        .reduce((total, entry) => total + (entry.duration_minutes ?? 0), 0),
-    [timeEntries],
-  )
-
-  const overdue = useMemo(
-    () => (tasks ?? []).filter((task) => dueState(task, task.status) === 'overdue').length,
-    [tasks],
-  )
+  const trackedMinutes = toCount(timeTotal?.tracked_minutes)
+  const totals = useMemo(() => summariseReport(reportRows), [reportRows])
+  const overdue = totals.overdue
 
   if (!can('reports.view')) {
     return (
@@ -121,13 +137,13 @@ export function ReportsPage() {
       ) : (
         <>
           <dl className="grid grid-cols-2 divide-x divide-y rounded-xl border sm:grid-cols-4 sm:divide-y-0">
-            <Summary label="Tasks" value={String((tasks ?? []).length)} />
+            <Summary label="Tasks" value={String(totals.total)} />
             <Summary label="Overdue" value={String(overdue)} tone={overdue > 0 ? 'danger' : undefined} />
             <Summary
               label="Tracked time"
               value={`${Math.round(trackedMinutes / 60)}h`}
             />
-            <Summary label="Projects" value={String((projects ?? []).length)} />
+            <Summary label="Projects" value={String(projectData.length)} />
           </dl>
 
           <div className="grid gap-4 lg:grid-cols-2">

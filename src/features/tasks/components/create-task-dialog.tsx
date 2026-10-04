@@ -49,6 +49,14 @@ export function CreateTaskDialog() {
   const defaultStatus = statuses.find((status) => status.is_default) ?? statuses[0]
   const defaultPriority = priorities.find((priority) => priority.level === 3) ?? priorities[0]
 
+  /**
+   * Projects, statuses and members arrive as separate queries. Opening the dialog
+   * before they land used to show an empty Project box, a disabled Assignee box
+   * and a submit button that could never fire, with no hint that data was still
+   * arriving.
+   */
+  const metaLoading = projects === undefined || statuses === undefined || loading
+
   const form = useForm<CreateTaskValues>({
     resolver: zodResolver(createTaskSchema),
     defaultValues: {
@@ -122,6 +130,11 @@ export function CreateTaskDialog() {
         <Form {...form}>
           <form onSubmit={onSubmit} noValidate className="space-y-4">
             {serverError ? <InlineError message={serverError} /> : null}
+            {metaLoading ? (
+              <p className="text-sm text-muted-foreground" role="status">
+                Loading projects and members…
+              </p>
+            ) : null}
 
             <FormField name="title">
               <FormItem>
@@ -280,7 +293,11 @@ export function CreateTaskDialog() {
               <Button type="button" variant="outline" onClick={closeCreate}>
                 Cancel
               </Button>
-              <Button type="submit" loading={form.formState.isSubmitting} disabled={projectId.length === 0}>
+              <Button
+                type="submit"
+                loading={form.formState.isSubmitting}
+                disabled={metaLoading || projectId.length === 0}
+              >
                 Create task
               </Button>
             </DialogFooter>

@@ -1,10 +1,12 @@
 import { useState } from 'react'
-import { Mail, Shield, UserPlus } from 'lucide-react'
+import { Link2, Mail, Shield, UserPlus } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { PageHeader } from '@/components/shared/page-header'
 import { UserAvatar } from '@/components/shared/user-avatar'
+import { PaginationBar } from '@/components/shared/pagination-bar'
 import { EmptyState, ErrorState, SkeletonList } from '@/components/shared/states'
+import { usePagination } from '@/hooks/use-pagination'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -41,6 +43,7 @@ import { usePermission, useWorkspace } from '@/features/organizations/workspace-
 import type { Role } from '@/types/database'
 
 import {
+  inviteLink,
   useInviteMember,
   useInvitations,
   useMembers,
@@ -49,11 +52,28 @@ import {
   useUpdateMemberRole,
 } from '../queries'
 
+async function copyInviteLink(token: string): Promise<void> {
+  const link = inviteLink(token)
+  try {
+    await navigator.clipboard.writeText(link)
+    toast.success('Invite link copied', { description: 'Send it to the person you invited.' })
+  } catch {
+    // Clipboard access is blocked in some browsers and over plain http.
+    toast.error('Could not copy the link', { description: link })
+  }
+}
+
 export function MembersPage() {
   const user = useCurrentUser()
   const { organizationName } = useWorkspace()
   const { can } = usePermission()
-  const { data: members, isPending, isError, refetch } = useMembers()
+  const pager = usePagination(25)
+  const { data, isPending, isError, refetch } = useMembers({
+    page: pager.page,
+    pageSize: pager.pageSize,
+  })
+  const members = data?.rows
+  const totalMembers = data?.total ?? 0
   const { data: invitations } = useInvitations()
   const updateRole = useUpdateMemberRole()
   const removeMember = useRemoveMember()
@@ -68,7 +88,7 @@ export function MembersPage() {
     <div className="mx-auto w-full max-w-4xl space-y-6 px-4 py-6 sm:px-6 lg:px-8">
       <PageHeader
         title="Members"
-        description={`${members?.length ?? 0} people have access to ${organizationName ?? 'this workspace'}.`}
+        description={`${totalMembers} ${totalMembers === 1 ? 'person has' : 'people have'} access to ${organizationName ?? 'this workspace'}.`}
         actions={
           can('members.invite') ? (
             <Button size="sm" onClick={() => setInviteOpen(true)}>
@@ -84,6 +104,7 @@ export function MembersPage() {
       ) : isError ? (
         <ErrorState title="Couldn't load members" onRetry={() => void refetch()} />
       ) : (
+        <>
         <ul className="divide-y rounded-xl border">
           {(members ?? []).map((member) => {
             const profile = member.profiles
@@ -138,6 +159,18 @@ export function MembersPage() {
             )
           })}
         </ul>
+        {isPending ? null : (
+        <PaginationBar
+          total={totalMembers}
+          rowCount={members?.length ?? 0}
+          page={pager.page}
+          pageSize={pager.pageSize}
+          onPageChange={pager.setPage}
+          onPageSizeChange={pager.setPageSize}
+          label="members"
+        />
+      )}
+        </>
       )}
 
       {(invitations ?? []).length > 0 ? (
@@ -147,11 +180,21 @@ export function MembersPage() {
           </h2>
           <ul className="divide-y rounded-xl border">
             {(invitations ?? []).map((invitation) => (
-              <li key={invitation.id} className="flex items-center gap-3 px-3 py-2.5">
+              <li key={invitation.id} className="flex flex-wrap items-center gap-3 px-3 py-2.5">
                 <Mail className="size-4 shrink-0 text-muted-foreground" aria-hidden />
                 <span className="min-w-0 flex-1 truncate text-sm">{invitation.email}</span>
                 <Badge variant="muted">{ROLE_LABELS[invitation.role]}</Badge>
-                {canManage ? (
+                {invitation.status === 'pending' && invitation.token ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => void copyInviteLink(invitation.token as string)}
+                  >
+                    <Link2 aria-hidden />
+                    Copy link
+                  </Button>
+                ) : null}
+                {invitation.status === 'pending' ? (
                   <Button variant="ghost" size="sm" onClick={() => revoke.mutate({ id: invitation.id })}>
                     Revoke
                   </Button>

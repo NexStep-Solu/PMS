@@ -5,6 +5,8 @@ export interface TaskWithMeta extends Task {
   status: TaskStatus
   priority: Priority | null
   assignee: { id: string; full_name: string | null; avatar_url: string | null } | null
+  /** Denormalised from `tasks_project_id_fkey` so every task view can name its project. */
+  project: { id: string; name: string; key: string } | null
   labels: { label_id: string; label: Label | null }[]
   subtaskCount?: number
   commentCount?: number

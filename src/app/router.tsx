@@ -70,6 +70,9 @@ const SettingsPage = lazy(() =>
 const TimeTrackingPage = lazy(() =>
   import('@/features/time-tracking/components/time-page').then((m) => ({ default: m.TimeTrackingPage })),
 )
+const InvitePage = lazy(() =>
+  import('@/features/organizations/components/invite-page').then((m) => ({ default: m.InvitePage })),
+)
 
 function Lazy({ children }: { children: React.ReactNode }) {
   return <Suspense fallback={<LoadingState />}>{children}</Suspense>
@@ -108,6 +111,15 @@ export function AppRouter() {
           }
         />
       </Route>
+
+      <Route
+        path="/invite/:token"
+        element={
+          <Suspense fallback={<LoadingState />}>
+            <InvitePage />
+          </Suspense>
+        }
+      />
 
       <Route
         path="/reset-password"

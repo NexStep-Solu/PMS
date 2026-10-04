@@ -175,3 +175,52 @@ describe('embedded resource syntax used by the client', () => {
     }
   })
 })
+describe('invitation join flow', () => {
+  const line = (needle: string) => sql.indexOf(needle)
+
+  it('defines accept/preview only after the tables they touch', () => {
+    // Postgres validates `language sql` bodies when they are created, so a
+    // function placed above its tables fails the whole migration.
+    for (const table of [
+      'create table public.organization_invitations',
+      'create table public.organization_members',
+      'create table public.profiles',
+    ]) {
+      expect(line(table), `${table} missing`).toBeGreaterThan(-1)
+      expect(line(table)).toBeLessThan(line('create or replace function public.invitation_preview'))
+    }
+
+    expect(line('create or replace function private.invitation_for_token')).toBeLessThan(
+      line('create or replace function public.accept_invitation'),
+    )
+  })
+
+  it('defines private.current_user_email before the policy that calls it', () => {
+    expect(line('create or replace function private.current_user_email')).toBeGreaterThan(-1)
+    expect(line('create or replace function private.current_user_email')).toBeLessThan(
+      line('create policy invitations_select'),
+    )
+  })
+
+  it('scopes accept_invitation to the invited email', () => {
+    const body = sql.slice(line('create or replace function public.accept_invitation'))
+    expect(body.slice(0, 2500)).toContain('invite.email <> caller_email')
+    expect(body.slice(0, 2500)).toContain('security definer')
+  })
+
+  it('only lets the invitee read their own pending invitation', () => {
+    expect(sql).toContain('(email = private.current_user_email() and status = \'pending\')')
+  })
+
+  it('lets signup join through the token instead of always minting a workspace', () => {
+    const body = sql.slice(line('create or replace function public.handle_new_user'))
+    expect(body.slice(0, 3000)).toContain('invite_token')
+    expect(body.slice(0, 3000)).toContain('public.accept_invitation')
+  })
+
+  it('does not expose accept_invitation to anonymous callers', () => {
+    expect(sql).toMatch(
+      /revoke all on function public\.accept_invitation\(uuid\) from public;[\s\S]*?grant execute on function public\.accept_invitation\(uuid\) to authenticated;/,
+    )
+  })
+})

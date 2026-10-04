@@ -34,10 +34,13 @@ export function TaskCalendarView({
   tasks,
   statuses,
   milestones,
+  projectId,
 }: {
   tasks: TaskWithMeta[]
   statuses: TaskStatus[]
   milestones: { id: string; name: string; due_date: string; status: string }[]
+  /** Keeps "New task" scoped to the project being viewed. */
+  projectId?: string
 }) {
   const { organizationName, can } = useWorkspace()
   const { openTask, openCreate } = useTaskDialog()
@@ -135,7 +138,7 @@ export function TaskCalendarView({
           <Button variant="ghost" size="sm" onClick={() => setAnchor(new Date())}>
             Today
           </Button>
-          <Button size="sm" onClick={() => openCreate()}>
+          <Button size="sm" onClick={() => openCreate({ projectId })}>
             <Plus aria-hidden />
             New task
           </Button>
@@ -157,7 +160,7 @@ export function TaskCalendarView({
           byDay={byDay}
           canCreate={can('tasks.create')}
           onOpenTask={openTask}
-          onCreate={() => openCreate()}
+          onCreate={() => openCreate({ projectId })}
           statusById={statusById}
         />
       )}

@@ -7,7 +7,7 @@ import { toast } from 'sonner'
 import { PageHeader } from '@/components/shared/page-header'
 import { ThemeSwitcher } from '@/components/layout/user-menu'
 import { UserAvatar } from '@/components/shared/user-avatar'
-import { InlineError, SkeletonPanel } from '@/components/shared/states'
+import { ErrorState, InlineError, SkeletonPanel } from '@/components/shared/states'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -16,6 +16,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { isDemoMode } from '@/lib/client'
 import { friendlyMessage } from '@/lib/db/errors'
 import { ROLE_DESCRIPTIONS, ROLE_LABELS } from '@/lib/permissions'
+import { nullable } from '@/lib/utils'
 import { useAuthActions, useCurrentUser, useProfile, useUpdateProfile } from '@/features/auth/queries'
 import { useWorkspace } from '@/features/organizations/workspace-context'
 import { useUpdateOrganization } from '@/features/organizations/queries'
@@ -62,9 +63,19 @@ export function SettingsPage() {
 /** Re-keys the form once the profile has loaded so defaults come from props. */
 function ProfileSection() {
   const user = useCurrentUser()
-  const { data: profile, isPending } = useProfile(user?.id)
+  const { data: profile, isPending, isError, refetch } = useProfile(user?.id)
 
   if (isPending) return <SkeletonPanel />
+  // Without this a failed profile read silently showed a blank, unsaved form.
+  if (isError) {
+    return (
+      <ErrorState
+        title="Couldn't load your profile"
+        description="Check your connection and try again."
+        onRetry={() => void refetch()}
+      />
+    )
+  }
 
   return <ProfileCard key={profile?.id ?? 'new'} profile={profile ?? null} />
 }
@@ -232,7 +243,7 @@ function OrganizationCard({ initialName }: { initialName: string }) {
           onClick={() => {
             setError(null)
             updateOrganization.mutate(
-              { name, logo_url: organization?.logo_url ?? null },
+              { name, logo_url: nullable(organization?.logo_url) },
               {
                 onError: (mutationError: unknown) => setError(friendlyMessage(mutationError as never)),
               },

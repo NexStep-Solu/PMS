@@ -94,7 +94,8 @@ export interface SelectBuilder<T, R = ListResponse<T>> extends PromiseLike<R> {
   or(filters: string): SelectBuilder<T, R>
   filter(column: string, operator: string, value: unknown): SelectBuilder<T, R>
   order(column: string, options?: OrderDirection | boolean): SelectBuilder<T, R>
-  limit(count: number): SelectBuilder<T, R>
+  /** `limit(1, { count: 'exact' })` also returns the total, for unread badges. */
+  limit(count: number, options?: { count?: 'exact' }): SelectBuilder<T, R>
   range(from: number, to: number): SelectBuilder<T, R>
   throwOnError(): SelectBuilder<T, R>
   single(): SelectBuilder<T, SingleResponse<T>>
@@ -222,8 +223,26 @@ export interface RealtimeApi {
 /* Client                                                              */
 /* ------------------------------------------------------------------ */
 
+/**
+ * A Postgres function call. The demo backend implements the handful of
+ * functions the app relies on so both paths behave identically.
+ */
+export interface RpcResult<T> {
+  data: T
+  error: AppError | null
+}
+
+export interface RpcApi {
+  /** `accept_invitation` and `workspace_report_*` return their rows as objects. */
+  <T = Record<string, unknown>>(
+    fn: string,
+    args?: Record<string, unknown>,
+  ): PromiseLike<RpcResult<T>>
+}
+
 export interface DatabaseClient {
   from<K extends TableName>(table: K): TableRef<DatabaseSchema[K]>
+  rpc: RpcApi
   auth: AuthApi
   storage: StorageApi
   realtime: RealtimeApi

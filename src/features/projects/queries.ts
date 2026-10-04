@@ -11,12 +11,14 @@ import type {
   ProjectFile,
   ProjectMember,
   ProjectRole,
+  ProjectStatus,
   TaskStatus,
 } from '@/types/database'
 
 import { recordActivity, type ActivityEntry } from '@/features/activity/queries'
 import { useWorkspace } from '@/features/organizations/workspace-context'
 
+import { projectChanges, projectPatch } from './patch'
 import type { CreateProjectValues, UpdateProjectValues } from './schemas'
 
 const PROJECT_SELECT = `
@@ -39,25 +41,78 @@ export interface ProjectWithMeta extends Project {
   }[]
 }
 
-export function useProjects(options: { includeArchived?: boolean } = {}) {
+/**
+ * Paginated project list.
+ *
+ * `pageSize: 0` returns everything, which is what pickers and roll-ups want. The
+ * projects *page* passes a real size so the browser never downloads a workspace's
+ * entire portfolio to render page one.
+ */
+export type ProjectSort = 'updated' | 'name' | 'due'
+
+export function useProjects(
+  options: {
+    includeArchived?: boolean
+    page?: number
+    pageSize?: number
+    /** Free-text filter, applied in the database so paging stays correct. */
+    search?: string
+    status?: ProjectStatus | 'all'
+    sort?: ProjectSort
+  } = {},
+) {
   const { organizationId } = useWorkspace()
+  const page = options.page ?? 1
+  const pageSize = options.pageSize ?? 0
+  const from = (page - 1) * pageSize
+  const to = from + pageSize - 1
+  const windowed = pageSize > 0
+  const search = options.search?.trim() ?? ''
+  const status = options.status ?? 'all'
+  const sort = options.sort ?? 'updated'
 
   return useQuery({
-    queryKey: [...keys.projects(organizationId ?? ''), options.includeArchived ?? false],
+    queryKey: [
+      ...keys.projects(organizationId ?? ''),
+      {
+        archived: options.includeArchived ?? false,
+        page,
+        pageSize,
+        search,
+        status,
+        sort,
+      },
+    ],
     enabled: Boolean(organizationId),
-    queryFn: async (): Promise<ProjectWithMeta[]> => {
-      const query = db()
+    queryFn: async (): Promise<{ rows: ProjectWithMeta[]; total: number }> => {
+      let query = db()
         .from('projects')
-        .select(PROJECT_SELECT)
+        .select(PROJECT_SELECT, { count: 'exact' })
         .eq('organization_id', organizationId as string)
-        .order('updated_at', { ascending: false })
 
-      const { data, error } = options.includeArchived
-        ? await query
-        : await query.neq('status', 'archived')
+      if (!options.includeArchived) query = query.neq('status', 'archived')
+      if (status !== 'all') query = query.eq('status', status)
+      if (search) {
+        // `*` is PostgREST's wildcard inside `or`; ilike so it is case-insensitive.
+        query = query.or(
+          `name.ilike.*${search}*,key.ilike.*${search}*,description.ilike.*${search}*`,
+        )
+      }
 
+      query =
+        sort === 'name'
+          ? query.order('name', { ascending: true })
+          : sort === 'due'
+            ? query.order('due_date', { ascending: true, nullsFirst: false })
+            : query.order('updated_at', { ascending: false })
+
+      if (windowed) query = query.range(from, to)
+
+      const { data, error, count } = await query
       if (error) throw error
-      return (data ?? []) as unknown as ProjectWithMeta[]
+
+      const rows = (data ?? []) as unknown as ProjectWithMeta[]
+      return { rows, total: windowed ? (count ?? rows.length) : rows.length }
     },
   })
 }
@@ -207,33 +262,6 @@ export function useLabels() {
 /* Mutations                                                           */
 /* ------------------------------------------------------------------ */
 
-function projectPatch(values: CreateProjectValues) {
-  return {
-    name: values.name,
-    key: values.key,
-    description: values.description ?? null,
-    status: values.status,
-    priority: values.priority,
-    start_date: values.startDate || null,
-    due_date: values.dueDate || null,
-    owner_id: values.ownerId ?? null,
-  }
-}
-
-/** Partial update: only the keys the caller actually provided are sent. */
-function projectChanges(values: UpdateProjectValues) {
-  const changes: Record<string, unknown> = {}
-  if (values.name !== undefined) changes.name = values.name
-  if (values.key !== undefined) changes.key = values.key
-  if (values.description !== undefined) changes.description = values.description || null
-  if (values.status !== undefined) changes.status = values.status
-  if (values.priority !== undefined) changes.priority = values.priority
-  if (values.startDate !== undefined) changes.start_date = values.startDate || null
-  if (values.dueDate !== undefined) changes.due_date = values.dueDate || null
-  if (values.ownerId !== undefined) changes.owner_id = values.ownerId || null
-  return changes
-}
-
 export function useCreateProject() {
   const client = useQueryClient()
   const { organizationId } = useWorkspace()
@@ -246,7 +274,7 @@ export function useCreateProject() {
           ...projectPatch(values),
           organization_id: organizationId as string,
           created_by: values.userId,
-        })
+        } as never)
         .select('*')
         .single()
       if (error) throw error

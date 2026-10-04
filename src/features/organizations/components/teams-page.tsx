@@ -12,13 +12,13 @@ import { db } from '@/lib/client'
 import { friendlyMessage } from '@/lib/db/errors'
 import { useWorkspace } from '@/features/organizations/workspace-context'
 
-import { useMembers, useTeams } from '../queries'
+import { useMemberOptions, useTeams } from '../queries'
 
 export function TeamsPage() {
   const { organizationId } = useWorkspace()
   const { can } = useWorkspace()
   const { data: teams, isPending, isError, refetch } = useTeams()
-  const { data: members } = useMembers()
+  const memberOptions = useMemberOptions()
 
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
@@ -70,13 +70,7 @@ export function TeamsPage() {
         <ul className="grid gap-3 sm:grid-cols-2">
           {(teams ?? []).map((team) => {
             const userIds = (team.team_members ?? []).map((member) => member.user_id)
-            const people = (members ?? [])
-              .filter((member) => userIds.includes(member.user_id))
-              .map((member) => ({
-                id: member.user_id,
-                full_name: member.profiles?.full_name ?? null,
-                avatar_url: member.profiles?.avatar_url ?? null,
-              }))
+            const people = memberOptions.filter((member) => userIds.includes(member.id))
             return (
               <li key={team.id} className="rounded-xl border p-4">
                 <h2 className="text-[15px] font-semibold">{team.name}</h2>
