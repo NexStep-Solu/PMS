@@ -6,6 +6,7 @@ import {
   endOfWeek,
   format,
   isSameMonth,
+  isToday,
   startOfMonth,
   startOfWeek,
 } from 'date-fns'
@@ -14,19 +15,23 @@ import { ChevronLeft, ChevronRight } from 'lucide-react'
 import { PriorityBadge, StatusBadge } from '@/components/shared/badges'
 import { UserAvatar } from '@/components/shared/user-avatar'
 import { Button } from '@/components/ui/button'
+import { STATUS_META } from '@/lib/constants'
 import { cn } from '@/lib/utils'
 
+import { useTaskDialog } from '../task-dialog-context'
 import { parseDay } from '../utils'
 import type { TaskWithMeta } from '../utils'
 import type { TaskStatus } from '@/types/database'
 
 /**
- * Deliberately simple timeline: rows are tasks, the horizontal axis is a month
- * grid, and each bar spans `start_date → due_date`. Dependency arrows are out
- * of scope for the first release — see PMS_START.md §10.
+ * Month grid with one row per task. Bars take their colour from the task's status
+ * category so the chart reads at a glance, single-day tasks render as milestone
+ * diamonds, and every row opens the detail drawer. Dependency arrows are out of
+ * scope for the first release — see PMS_START.md §10.
  */
 export function TaskTimelineView({ tasks, statuses }: { tasks: TaskWithMeta[]; statuses: TaskStatus[] }) {
   const [anchor, setAnchor] = useState(() => new Date())
+  const { openTask } = useTaskDialog()
 
   const statusById = useMemo(() => new Map(statuses.map((status) => [status.id, status])), [statuses])
 
@@ -38,6 +43,7 @@ export function TaskTimelineView({ tasks, statuses }: { tasks: TaskWithMeta[]; s
   }, [anchor])
 
   const totalDays = days.length
+
 
   const scheduled = useMemo(
     () =>
@@ -56,6 +62,10 @@ export function TaskTimelineView({ tasks, statuses }: { tasks: TaskWithMeta[]; s
 
   const position = (date: Date) =>
     ((differenceInCalendarDays(date, range.start) / Math.max(totalDays - 1, 1)) * 100)
+
+  const today = new Date()
+  const showToday = today >= range.start && today <= range.end
+  const todayPosition = showToday ? position(today) : 0
 
   return (
     <div className="space-y-3">
@@ -82,62 +92,104 @@ export function TaskTimelineView({ tasks, statuses }: { tasks: TaskWithMeta[]; s
         </span>
       </div>
 
-      <div className="overflow-hidden rounded-xl border">
-        <div className="flex border-b bg-muted/40">
-          <div className="w-56 shrink-0 px-3 py-2 text-xs font-medium text-muted-foreground">
-            Task
-          </div>
-          <div className="relative flex-1">
-            <div className="grid grid-cols-[repeat(auto-fit,minmax(0,1fr))]">
-              {days.map((day, index) => (
-                <div
-                  key={day.toISOString()}
-                  className={cn(
-                    'border-l px-1 py-2 text-center text-[10px] text-muted-foreground first:border-l-0',
-                    !isSameMonth(day, anchor) && 'opacity-40',
-                  )}
-                  style={{ gridColumnStart: index + 1 }}
-                >
-                  {format(day, 'd')}
-                </div>
-              ))}
+      <div className="overflow-x-auto rounded-xl border">
+        <div className="min-w-[880px]">
+          <div className="flex border-b bg-muted/40">
+            <div className="sticky left-0 z-10 w-56 shrink-0 bg-muted px-3 py-2 text-xs font-medium text-muted-foreground">
+              Task
+            </div>
+            <div className="relative flex-1">
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(0,1fr))]">
+                {days.map((day, index) => {
+                  const weekend = day.getDay() === 0 || day.getDay() === 6
+                  const today = isToday(day)
+                  return (
+                    <div
+                      key={day.toISOString()}
+                      className={cn(
+                        'border-l px-1 py-2 text-center text-[10px] text-muted-foreground first:border-l-0',
+                        !isSameMonth(day, anchor) && 'opacity-40',
+                        weekend && 'bg-muted/60',
+                        today && 'bg-primary/10 font-semibold text-primary opacity-100',
+                      )}
+                      style={{ gridColumnStart: index + 1 }}
+                    >
+                      {format(day, 'd')}
+                    </div>
+                  )
+                })}
+              </div>
             </div>
           </div>
-        </div>
 
-        <ul className="divide-y">
-          {scheduled.map(({ task, start, end }) => {
-            const status = statusById.get(task.status_id)
-            const left = Math.max(position(start), 0)
-            const right = Math.min(position(addDays(end, 1)), 100)
-            const width = Math.max(right - left, 1.5)
+          <ul className="divide-y">
+            {scheduled.map(({ task, start, end }) => {
+              const status = statusById.get(task.status_id)
+              const category = status?.category ?? task.status.category
+              const colours = STATUS_META[category].classes
+              const milestone = start.getTime() === end.getTime()
+              const centre = (position(start) + position(addDays(end, 1))) / 2
+              const left = Math.max(position(start), 0)
+              const right = Math.min(position(addDays(end, 1)), 100)
+              const width = Math.max(right - left, 1.5)
+              const detail = `${task.title} · ${status?.name ?? task.status.name}${task.assignee?.full_name ? ` · ${task.assignee.full_name}` : ''}: ${format(start, 'd MMM')} – ${format(end, 'd MMM')}`
 
-            return (
-              <li key={task.id} className="flex items-stretch">
-                <div className="flex w-56 shrink-0 items-center gap-2 px-3 py-2">
-                  <span className="min-w-0 flex-1 truncate text-sm" title={task.title}>
-                    {task.title}
-                  </span>
-                  <UserAvatar person={task.assignee} size={18} />
-                </div>
-                <div className="relative flex-1 bg-grid-lines bg-[length:100%_100%] py-2">
-                  <span
-                    className={cn(
-                      'absolute top-1/2 flex h-5 -translate-y-1/2 items-center gap-1 rounded px-1.5 text-[11px] whitespace-nowrap',
-                      status?.is_completed
-                        ? 'bg-status-done-bg text-status-done'
-                        : 'bg-primary/12 text-primary',
+              return (
+                <li key={task.id} className="group flex items-stretch hover:bg-accent/40">
+                  <div className="sticky left-0 z-10 flex w-56 shrink-0 items-center gap-2 bg-background px-3 py-2 group-hover:bg-accent/40">
+                    <button
+                      type="button"
+                      onClick={() => openTask(task.id)}
+                      className="min-w-0 flex-1 truncate rounded text-left text-sm hover:underline focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                      title={detail}
+                    >
+                      {task.title}
+                    </button>
+                    <UserAvatar person={task.assignee} size={18} />
+                  </div>
+                  <div className="relative flex-1 bg-grid-lines bg-[length:100%_100%] py-2.5">
+                    {showToday ? (
+                      <span
+                        aria-hidden
+                        className="absolute inset-y-0 w-px bg-primary/50"
+                        style={{ left: `${todayPosition}%` }}
+                      />
+                    ) : null}
+                    {milestone ? (
+                      <button
+                        type="button"
+                        onClick={() => openTask(task.id)}
+                        aria-label={detail}
+                        title={detail}
+                        className={cn(
+                          'absolute top-1/2 size-3 -translate-x-1/2 -translate-y-1/2 rotate-45 rounded-[3px] ring-2 ring-background transition-transform hover:scale-125 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
+                          colours,
+                        )}
+                        style={{ left: `${centre}%` }}
+                      />
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => openTask(task.id)}
+                        className={cn(
+                          'absolute top-1/2 flex h-6 max-w-full -translate-y-1/2 items-center gap-1 rounded-md px-1.5 text-[11px] whitespace-nowrap transition-[filter] hover:brightness-95 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
+                          colours,
+                          status?.is_completed && 'opacity-80',
+                        )}
+                        style={{ left: `${left}%`, width: `${width}%` }}
+                        title={detail}
+                      >
+                        <span className="truncate">
+                          {format(start, 'd MMM')} – {format(end, 'd MMM')}
+                        </span>
+                      </button>
                     )}
-                    style={{ left: `${left}%`, width: `${width}%` }}
-                    title={`${task.title}: ${format(start, 'd MMM')} – ${format(end, 'd MMM')}`}
-                  >
-                    <span className="truncate">{format(start, 'd MMM')} – {format(end, 'd MMM')}</span>
-                  </span>
-                </div>
-              </li>
-            )
-          })}
-        </ul>
+                  </div>
+                </li>
+              )
+            })}
+          </ul>
+        </div>
       </div>
 
       {scheduled.length === 0 ? (

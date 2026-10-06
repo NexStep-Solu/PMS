@@ -64,6 +64,18 @@ export function TaskCalendarView({
     return map
   }, [tasks])
 
+  /**
+   * Clicking a day cell (or "+N more") drops into the day agenda for that date.
+   * Before, month cells had no action at all, so clicking an empty day or the
+   * overflow row visibly did nothing.
+   */
+  const goToDay = (key: string) => {
+    const [year, month, day] = key.split('-').map(Number)
+    if (!year || !month || !day) return
+    setAnchor(new Date(year, month - 1, day))
+    setView('day')
+  }
+
   const step = (direction: -1 | 1) => {
     setAnchor((current) => {
       const days = view === 'day' ? 1 : view === 'week' ? 7 : 30
@@ -89,7 +101,10 @@ export function TaskCalendarView({
           <li key={task.id}>
             <button
               type="button"
-              onClick={() => openTask(task.id)}
+              onClick={(event) => {
+                event.stopPropagation()
+                openTask(task.id)
+              }}
               className={cn(
                 'flex w-full items-center gap-1 truncate rounded px-1 py-0.5 text-left text-[11px] transition-colors hover:bg-accent',
                 task.status.is_completed && 'text-muted-foreground line-through',
@@ -105,7 +120,18 @@ export function TaskCalendarView({
           </li>
         ))}
         {items.length > limit ? (
-          <li className="px-1 text-[11px] text-muted-foreground">+{items.length - limit} more</li>
+          <li>
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation()
+                goToDay(key)
+              }}
+              className="rounded px-1 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              +{items.length - limit} more
+            </button>
+          </li>
         ) : null}
       </ul>
     )
@@ -151,7 +177,7 @@ export function TaskCalendarView({
 
       {view === 'month' ? (
         <div className="rounded-xl border">
-          <MonthGrid month={anchor} renderDay={renderDay} />
+          <MonthGrid month={anchor} renderDay={renderDay} onSelect={goToDay} />
         </div>
       ) : (
         <AgendaView

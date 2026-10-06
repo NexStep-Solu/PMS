@@ -14,6 +14,19 @@
 create extension if not exists pgcrypto;
 create extension if not exists citext;
 
+-- organization_invitations.email is citext, and the table is only created once.
+-- If the extension is unavailable the failure would otherwise surface much later
+-- as a confusing "type citext does not exist" against an unrelated line, so say
+-- so here, at the point where the fix is obvious.
+do $extcheck$
+begin
+  if to_regtype('citext') is null then
+    raise exception
+      'The citext extension is required by organization_invitations.email but is not installed. Enable it (Dashboard > Database > Extensions, or: create extension citext;) and re-run this script.';
+  end if;
+end
+$extcheck$;
+
 -- ---------------------------------------------------------------------
 -- Enums
 -- ---------------------------------------------------------------------
@@ -712,13 +725,21 @@ $$;
 -- through the token so the two flows cannot drift.
 -- ---------------------------------------------------------------------
 
+/**
+ * The caller's email, lower-cased.
+ *
+ * Deliberately `text` rather than `citext`: this function is re-parsed on every
+ * migration run, so depending on an optional extension would make the whole
+ * migration fail on any project where `citext` is unavailable. Comparison sites do
+ * the case-folding explicitly.
+ */
 create or replace function private.current_user_email()
-returns citext
+returns text
 language sql
 stable
 set search_path = ''
 as $$
-  select nullif(auth.jwt() ->> 'email', '')::citext
+  select lower(nullif(auth.jwt() ->> 'email', ''))
 $$;
 
 create or replace function private.invitation_for_token(p_token uuid)
@@ -752,7 +773,7 @@ set search_path = ''
 as $$
 declare
   invite public.organization_invitations;
-  caller_email citext;
+  caller_email text;
   member_role public.role;
 begin
   if p_token is null then
@@ -767,7 +788,7 @@ begin
 
   caller_email := private.current_user_email();
 
-  if caller_email is null or invite.email <> caller_email then
+  if caller_email is null or lower(invite.email::text) <> caller_email then
     raise exception 'This invitation was sent to %.' , invite.email
       using errcode = 'insufficient_privilege';
   end if;
@@ -793,7 +814,7 @@ $$;
 create or replace function public.invitation_preview(p_token uuid)
 returns table (
   organization_name text,
-  invited_email citext,
+  invited_email text,
   role public.role,
   invited_by text,
   is_valid boolean,
@@ -806,7 +827,7 @@ set search_path = ''
 as $$
   select
     o.name,
-    i.email,
+    i.email::text,
     i.role,
     coalesce(p.full_name, 'A teammate'),
     (i.status = 'pending' and i.expires_at > now()),
@@ -1202,7 +1223,7 @@ create policy invitations_select on public.organization_invitations
   using (
     private.is_org_admin(organization_id)
     -- The invitee needs to see their own invitation before they are a member.
-    or (email = private.current_user_email() and status = 'pending')
+    or (lower(email::text) = private.current_user_email() and status = 'pending')
   );
 
 drop policy if exists "invitations_insert" on public.organization_invitations;

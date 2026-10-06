@@ -13,6 +13,7 @@ import { describe, expect, it } from 'vitest'
  */
 
 const verify = readFileSync('supabase/verify.sql', 'utf8')
+const migration = readFileSync('supabase/migrations/0001_init.sql', 'utf8')
 
 /** Columns referenced from each system catalogue / view, from PG 15–17 docs. */
 const CATALOG_COLUMNS: Record<string, Set<string>> = {
@@ -96,5 +97,77 @@ describe('verify.sql uses real catalogue columns', () => {
     expect(verify).toContain('prosecdef')              // SECURITY DEFINER recursion
     expect(verify).toContain('with_check')             // half-applied policy rewrite
     expect(verify).toMatch(/has_schema_privilege/)     // anon reaching `private`
+  })
+})
+describe('search_path hardening', () => {
+  /**
+   * Functions are created with `search_path = ''`, so only `pg_catalog` is
+   * implicitly searched. An unqualified reference to anything outside it —
+   * `citext`, for instance — fails to resolve at CREATE time even when the
+   * extension is installed, and the error points hundreds of statements into the
+   * migration instead of at the cause.
+   */
+  const PG_CATALOG = new Set([
+    'text', 'uuid', 'boolean', 'int', 'integer', 'bigint', 'smallint', 'numeric',
+    'real', 'double precision', 'date', 'time', 'timestamp', 'timestamptz',
+    'interval', 'json', 'jsonb', 'bytea', 'void', 'record', 'inet', 'xml',
+    'trigger',
+  ])
+
+  /** Only a bare, unqualified identifier can fail to resolve. */
+  const isUnqualifiedNonCatalog = (type: string) =>
+    /^[a-z_][a-z_0-9]*$/.test(type) && !PG_CATALOG.has(type)
+
+  it('never names a non-catalog type without qualifying it', () => {
+    const offenders: string[] = []
+
+    for (const match of migration.matchAll(
+      /create or replace function\s+([^\n]+)\n([\s\S]*?)\$\$;/g,
+    )) {
+      const [whole, signature = '', body = ''] = match
+      if (!body.includes("search_path = ''")) continue
+      const name = signature.trim()
+
+      // `returns table (...)` has its column types checked separately below, so
+      // do not mistake the first column name for a return type.
+      const returnTable = whole.match(/returns\s+table\s*\(([\s\S]*?)\)\s*language/i)?.[1]
+      const returnsTable = whole.match(/\)\s*returns\s+table\b/i)
+
+      if (!returnsTable) {
+        // `returns public.role` is qualified and fine; `returns citext` is not.
+        const type = whole.match(/\)\s*returns\s+([a-z_][a-z_0-9.]*)/i)?.[1]
+        if (type && isUnqualifiedNonCatalog(type)) {
+          offenders.push(`${name} returns ${type}`)
+        }
+      }
+
+      if (returnTable) {
+        for (const [, , type = ''] of returnTable.matchAll(/([a-z_][a-z_0-9]*)\s+([a-z_][a-z_0-9.]*)/gi)) {
+          if (isUnqualifiedNonCatalog(type)) {
+            offenders.push(`${name} returns table column of type ${type}`)
+          }
+        }
+      }
+
+      // Declared variables, but only inside a plpgsql DECLARE section. Scanning the
+      // whole body would match statements such as `return new;`.
+      const declareSection = body.match(/\bdeclare\b([\s\S]*?)\bbegin\b/i)?.[1] ?? ''
+      for (const [, variable = '', type = ''] of declareSection.matchAll(
+        /^\s*([a-z_][a-z_0-9]*)\s+([a-z_][a-z_0-9.]*)\s*;/gim,
+      )) {
+        if (isUnqualifiedNonCatalog(type)) {
+          offenders.push(`${name} declares ${variable} ${type}`)
+        }
+      }
+    }
+
+    expect(offenders).toEqual([])
+  })
+
+  it('fails fast with a clear message when citext is missing', () => {
+    // organization_invitations.email is citext and the table is created once, so
+    // a missing extension would otherwise surface as a confusing late error.
+    expect(migration).toContain("to_regtype('citext')")
+    expect(migration).toMatch(/citext extension is required/i)
   })
 })

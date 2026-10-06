@@ -204,12 +204,13 @@ describe('invitation join flow', () => {
 
   it('scopes accept_invitation to the invited email', () => {
     const body = sql.slice(line('create or replace function public.accept_invitation'))
-    expect(body.slice(0, 2500)).toContain('invite.email <> caller_email')
+    // Case-folded explicitly: current_user_email returns text, not citext.
+    expect(body.slice(0, 2500)).toContain('lower(invite.email::text) <> caller_email')
     expect(body.slice(0, 2500)).toContain('security definer')
   })
 
   it('only lets the invitee read their own pending invitation', () => {
-    expect(sql).toContain('(email = private.current_user_email() and status = \'pending\')')
+    expect(sql).toContain("lower(email::text) = private.current_user_email() and status = 'pending'")
   })
 
   it('lets signup join through the token instead of always minting a workspace', () => {

@@ -142,17 +142,28 @@ export function MonthGrid({
           const key = toDateKey(day)
           const outside = !isSameMonth(day, month)
           const isSelected = selected === key
+          // A plain <div>, not a <button>: the calendar renders one interactive
+          // control per task *inside* the cell, and a button-in-a-button is invalid
+          // HTML whose clicks browsers handle unpredictably (Safari drops them).
+          // With no onSelect the cell is a plain container, never a dead control.
           return (
-            <button
+            <div
               key={key}
-              type="button"
+              role={onSelect ? 'button' : undefined}
+              tabIndex={onSelect ? 0 : undefined}
               onClick={() => onSelect?.(key)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault()
+                  onSelect?.(key)
+                }
+              }}
               aria-pressed={isSelected}
               aria-label={format(day, 'd MMMM yyyy')}
               className={cn(
                 'min-h-16 border-r border-b p-1 text-left align-top transition-colors last:border-r-0 focus-visible:z-10 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
                 outside && 'bg-muted/30 text-muted-foreground/60',
-                !outside && 'hover:bg-accent/60',
+                !outside && onSelect && 'hover:bg-accent/60',
                 isSelected && 'bg-accent',
               )}
             >
@@ -166,7 +177,7 @@ export function MonthGrid({
                 {format(day, 'd')}
               </span>
               {renderDay ? <div className="mt-1 space-y-1">{renderDay(day, key)}</div> : null}
-            </button>
+            </div>
           )
         })}
       </div>
